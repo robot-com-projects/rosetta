@@ -372,7 +372,8 @@ def port_bags(
     push_to_hub: bool = False,
     num_shards: int | None = None,
     shard_index: int | None = None,
-    vcodec: str = "libsvtav1",
+    encoding_kwargs: dict | None = None,
+    batch_encoding_size: int = 1,
 ):
     """
     Port ROS2 bags to LeRobot dataset format.
@@ -385,8 +386,9 @@ def port_bags(
         push_to_hub: Whether to upload to HuggingFace Hub after porting.
         num_shards: Total number of shards for parallel processing.
         shard_index: Index of this shard (0 to num_shards-1).
-        vcodec: Video codec for encoding. Options: 'libsvtav1' (default, good compression),
-            'libx264'/'h264' (fast), 'hevc', 'h264_nvenc' (GPU).
+        encoding_kwargs: Keyword arguments forwarded to ``encode_video_frames``
+            (e.g. vcodec, pix_fmt, g, crf, fast_decode).
+        batch_encoding_size: Number of episodes per encoding batch. Defaults to 1 for immediate encoding.
     """
     contract = load_contract(contract_path)
     specs = list(iter_specs(contract))
@@ -420,7 +422,9 @@ def port_bags(
         robot_type=contract.robot_type,
         fps=contract.fps,
         features=features,
-        vcodec=vcodec,
+        encoding_kwargs=encoding_kwargs,
+        defer_video_encoding=False,
+        batch_encoding_size=batch_encoding_size,
     )
 
     start_time = time.time()
@@ -520,10 +524,38 @@ def main():
         choices=["libsvtav1", "libx264", "h264", "hevc", "h264_nvenc"],
         help="Video codec for encoding (default: libsvtav1). Use libx264/h264 for faster encoding."
     )
+    parser.add_argument(
+        "--pix-fmt", type=str, default=None,
+        help="Pixel format (default: yuv420p)."
+    )
+    parser.add_argument(
+        "--g", type=int, default=None,
+        help="GOP size / keyframe interval (default: 2)."
+    )
+    parser.add_argument(
+        "--crf", type=int, default=None,
+        help="Constant rate factor / quality (default: 30)."
+    )
+    parser.add_argument(
+        "--fast-decode", type=int, default=None,
+        help="Fast-decode tuning flag (default: 0, codec-dependent)."
+    )
 
     args = parser.parse_args()
 
     repo_id = args.repo_id or args.raw_dir.name
+
+    encoding_kwargs = {}
+    if args.vcodec is not None:
+        encoding_kwargs["vcodec"] = args.vcodec
+    if args.pix_fmt is not None:
+        encoding_kwargs["pix_fmt"] = args.pix_fmt
+    if args.g is not None:
+        encoding_kwargs["g"] = args.g
+    if args.crf is not None:
+        encoding_kwargs["crf"] = args.crf
+    if args.fast_decode is not None:
+        encoding_kwargs["fast_decode"] = args.fast_decode
 
     try:
         port_bags(
@@ -534,7 +566,7 @@ def main():
             push_to_hub=args.push_to_hub,
             num_shards=args.num_shards,
             shard_index=args.shard_index,
-            vcodec=args.vcodec,
+            encoding_kwargs=encoding_kwargs or None,
         )
     except KeyboardInterrupt:
         logging.info("\nInterrupted by user")
