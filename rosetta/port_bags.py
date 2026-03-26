@@ -278,11 +278,48 @@ def _sample_frame(
     return frame
 
 
+def _observation_buffers_ready(
+    buffers: dict[str, tuple[StreamSpec, StreamBuffer]],
+) -> bool:
+    """True when every observation stream has at least one buffered sample."""
+    for spec, buf in buffers.values():
+        if isinstance(spec, ObservationStreamSpec) and not buf.has_data():
+            return False
+    return True
+
+
+def _max_observation_last_ts_ns(
+    buffers: dict[str, tuple[StreamSpec, StreamBuffer]],
+) -> int:
+    """Latest sample timestamp among observation streams (all must have data)."""
+    ts_max = 0
+    for spec, buf in buffers.values():
+        if isinstance(spec, ObservationStreamSpec):
+            ts = buf.latest_ts_ns()
+            if ts is None:
+                raise RuntimeError("Internal error: observation buffer empty when computing sync time")
+            if ts > ts_max:
+                ts_max = ts
+    return ts_max
+
+
+def _first_tick_index_on_or_after(start_ns: int, step_ns: int, t_ns: int) -> int:
+    """Smallest i >= 0 such that start_ns + i * step_ns >= t_ns."""
+    if t_ns <= start_ns:
+        return 0
+    return int((t_ns - start_ns + step_ns - 1) // step_ns)
+
+
 def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
     """Stream LeRobot frames from a bag file.
 
     Uses StreamBuffer for resampling (identical to live inference).
     Specs sharing the same key are aggregated into single tensors.
+
+    Emission starts only after every observation stream has received at least one
+    message, and the first tick is aligned to the contract FPS grid on or after
+    the latest of those sample timestamps—so initial frames are not zero-filled
+    for missing camera data.
     """
     fps = specs[0].fps
     step_ns = int(1e9 / fps)
@@ -308,16 +345,23 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
     n_frames = max(1, int((end_ns - start_ns) // step_ns) + 1)
 
     current_tick_idx = 0
-    current_tick_ns = start_ns
     header_warned: set[str] = set()
 
-    while reader.has_next():
-        topic, data, bag_ns = reader.read_next()
+    wait_for_observations = any(
+        isinstance(spec, ObservationStreamSpec) for spec, _ in buffers.values()
+    )
+    priming = wait_for_observations
+    emit_start_idx = 0
 
-        # Emit frames whose tick time has passed
-        while current_tick_idx < n_frames and bag_ns >= current_tick_ns:
-            frame = _sample_frame(current_tick_ns, buffers)
-            frame["is_first"] = np.array([current_tick_idx == 0], dtype=bool)
+    def emit_until(bag_ns_limit: int | None):
+        """Yield frames for ticks <= bag_ns_limit (or all remaining if limit is None)."""
+        nonlocal current_tick_idx
+        while current_tick_idx < n_frames:
+            tick_ns = start_ns + current_tick_idx * step_ns
+            if bag_ns_limit is not None and bag_ns_limit < tick_ns:
+                break
+            frame = _sample_frame(tick_ns, buffers)
+            frame["is_first"] = np.array([current_tick_idx == emit_start_idx], dtype=bool)
             frame["is_last"] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
             frame["is_terminal"] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
             frame["task"] = prompt
@@ -325,7 +369,16 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
             yield frame
 
             current_tick_idx += 1
-            current_tick_ns = start_ns + current_tick_idx * step_ns
+
+    while reader.has_next():
+        topic, data, bag_ns = reader.read_next()
+
+        # Standard order: emit ticks up to bag time, then push. While priming the
+        # bag, only push so observation buffers fill before any frames (avoids
+        # black PNGs). The first batch after priming is emitted *after* push so
+        # the frame includes the message that completed priming.
+        if not priming:
+            yield from emit_until(bag_ns)
 
         # Push message to buffer
         if topic in buffers:
@@ -347,18 +400,24 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
             if val is not None:
                 buffer.push(ts, val)
 
-    # Emit remaining frames
-    while current_tick_idx < n_frames:
-        frame = _sample_frame(current_tick_ns, buffers)
-        frame["is_first"] = np.array([current_tick_idx == 0], dtype=bool)
-        frame["is_last"] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
-        frame["is_terminal"] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
-        frame["task"] = prompt
+        if priming and _observation_buffers_ready(buffers):
+            t_sync = _max_observation_last_ts_ns(buffers)
+            emit_start_idx = _first_tick_index_on_or_after(start_ns, step_ns, t_sync)
+            if emit_start_idx >= n_frames:
+                raise RuntimeError(
+                    f"No output frames left after syncing observations in {bag_dir.name}: "
+                    f"sync tick index {emit_start_idx} >= {n_frames}."
+                )
+            current_tick_idx = emit_start_idx
+            priming = False
+            yield from emit_until(bag_ns)
 
-        yield frame
+    if priming:
+        raise RuntimeError(
+            f"Bag ended before every observation stream produced data: {bag_dir.name}"
+        )
 
-        current_tick_idx += 1
-        current_tick_ns = start_ns + current_tick_idx * step_ns
+    yield from emit_until(None)
 
 
 # ---------- Main porting function ----------

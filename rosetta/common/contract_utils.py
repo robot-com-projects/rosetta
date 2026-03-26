@@ -169,6 +169,16 @@ class StreamBuffer:
                 return self.last_val if (tick_ns - self.last_ts <= self.tol_ns) else None
             return self.last_val  # hold is default
 
+    def has_data(self) -> bool:
+        """Return True if at least one sample has been pushed."""
+        with self._lock:
+            return self.last_ts is not None
+
+    def latest_ts_ns(self) -> int | None:
+        """Timestamp (ns) of the most recently pushed sample, or None if empty."""
+        with self._lock:
+            return self.last_ts
+
     def _clear_unsafe(self) -> None:
         """Clear buffered data without acquiring lock (internal use only)."""
         self.last_ts = None
