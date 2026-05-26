@@ -475,13 +475,21 @@ def port_bags(
 
     # LeRobot uses root directly as dataset path, so append repo_id
     dataset_root = root / repo_id if root else None
+    # The lerobot fork takes ``vcodec`` as a dedicated create() arg (stored as
+    # self.vcodec) and passes it explicitly at encode time alongside
+    # ``**encoding_kwargs``. Leaving ``vcodec`` inside encoding_kwargs collides:
+    # "encode_video_frames() got multiple values for keyword argument 'vcodec'".
+    # Split it out so callers can keep bundling it in encoding_kwargs.
+    create_encoding_kwargs = dict(encoding_kwargs or {})
+    vcodec = create_encoding_kwargs.pop("vcodec", None)
     lerobot_dataset = LeRobotDataset.create(
         repo_id=repo_id,
         root=dataset_root,
         robot_type=contract.robot_type,
         fps=contract.fps,
         features=features,
-        encoding_kwargs=encoding_kwargs,
+        encoding_kwargs=create_encoding_kwargs or None,
+        **({"vcodec": vcodec} if vcodec is not None else {}),
         defer_video_encoding=False,
         batch_encoding_size=batch_encoding_size,
     )
