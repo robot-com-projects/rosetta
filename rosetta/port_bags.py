@@ -134,6 +134,10 @@ def _build_buffers(
             logging.warning('Topic %s not in bag, skipping %s', spec.topic, spec.key)
             continue
 
+        # Derivative specs are handled by _precompute_derivatives, not StreamBuffer
+        if isinstance(spec, ObservationStreamSpec) and spec.derive:
+            continue
+
         if isinstance(spec, ObservationStreamSpec):
             buffer = StreamBuffer.from_spec(spec)
         else:
@@ -172,20 +176,17 @@ def _build_features(specs: list[StreamSpec]) -> dict[str, dict[str, Any]]:
             features[key] = build_feature(first)
         else:
             # Numeric: aggregate names from all specs
+            if dtype == 'float64':
+                dtype = 'float32'
             all_names = []
             for spec in key_specs:
-                all_names.extend(get_namespaced_names(spec))
+                all_names.extend(spec.names if spec.names else get_namespaced_names(spec))
             n = len(all_names) or 1
             features[key] = {
                 'dtype': dtype,
                 'shape': (n,),
                 'names': all_names if all_names else None,
             }
-
-    # Frame boundary markers
-    features['is_first'] = {'dtype': 'bool', 'shape': (1,), 'names': None}
-    features['is_last'] = {'dtype': 'bool', 'shape': (1,), 'names': None}
-    features['is_terminal'] = {'dtype': 'bool', 'shape': (1,), 'names': None}
 
     return features
 
@@ -201,10 +202,76 @@ def _get_bag_time_bounds_ns(reader: rosbag2_py.SequentialReader) -> tuple[int, i
     return start_ns, start_ns + duration_ns
 
 
+def _nearest_idx(timestamps: np.ndarray, t: int) -> int:
+    """Return index of the timestamp in `timestamps` nearest to `t`."""
+    idx = np.searchsorted(timestamps, t)
+    if idx == 0:
+        return 0
+    if idx == len(timestamps):
+        return len(timestamps) - 1
+    return idx - 1 if abs(timestamps[idx - 1] - t) <= abs(timestamps[idx] - t) else idx
+
+
+def _precompute_derivatives(
+    uri: str,
+    storage_id: str,
+    deriv_specs: list[ObservationStreamSpec],
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """First pass: collect full-rate position data and compute velocity via np.gradient.
+
+    np.gradient(positions, median_dt, axis=0)
+    where median_dt = median of positive inter-sample intervals in seconds.
+
+    Returns {topic: (timestamps_ns, velocities)} where velocities has shape (N, D).
+    """
+    topic_to_spec = {s.topic: s for s in deriv_specs}
+    topic_history: dict[str, list[tuple[int, np.ndarray]]] = {s.topic: [] for s in deriv_specs}
+
+    reader = rosbag2_py.SequentialReader()
+    reader.open(
+        rosbag2_py.StorageOptions(uri=uri, storage_id=storage_id),
+        rosbag2_py.ConverterOptions(
+            input_serialization_format='cdr',
+            output_serialization_format='cdr',
+        ),
+    )
+
+    while reader.has_next():
+        topic, data, bag_ns = reader.read_next()
+        if topic not in topic_history:
+            continue
+        spec = topic_to_spec[topic]
+        msg = deserialize_message(data, get_message(spec.msg_type))
+        ts, _ = get_message_timestamp_ns(msg, spec, bag_ns)
+        val = decode_value(msg, spec)
+        if val is not None:
+            topic_history[topic].append((ts, np.asarray(val, dtype=np.float64).flatten()))
+
+    result: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for topic, history in topic_history.items():
+        if len(history) < 2:
+            logging.warning('Not enough samples for derivative on topic %s (%d)', topic, len(history))
+            continue
+        timestamps = np.array([h[0] for h in history], dtype=np.float64)
+        positions = np.stack([h[1] for h in history])  # (N, D)
+
+        dts_s = np.diff(timestamps) / 1e9
+        pos_dts = dts_s[dts_s > 0]
+        if pos_dts.size == 0:
+            continue
+        median_dt = float(np.median(pos_dts))
+        velocities = np.gradient(positions, median_dt, axis=0)  # central differences
+
+        result[topic] = (timestamps, velocities)
+        logging.debug('Precomputed velocity for %s: %d samples, median_dt=%.4fs', topic, len(history), median_dt)
+
+    return result
+
+
 # Map LeRobot dtype strings to numpy dtypes
 DTYPE_MAP = {
     'float32': np.float32,
-    'float64': np.float64,
+    'float64': np.float32, # visualizer has issues with float64
     'int32': np.int32,
     'int64': np.int64,
     'bool': bool,
@@ -214,21 +281,37 @@ DTYPE_MAP = {
 def _sample_frame(
     tick_ns: int,
     buffers: dict[str, tuple[StreamSpec, StreamBuffer]],
+    deriv_specs: list[ObservationStreamSpec] | None = None,
+    derivatives: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> dict[str, Any]:
     """
     Sample a single frame from buffers at the given tick time.
 
     Specs sharing the same key are aggregated (concatenated in insertion order).
+    Derivative specs (derive='true') are looked up from pre-computed arrays
+    and appended after regular buffer values for the same key.
     """
     # Group by output key, preserving insertion order
     by_key: dict[str, list[tuple[StreamSpec, StreamBuffer]]] = {}
     for spec, buffer in buffers.values():
         by_key.setdefault(spec.key, []).append((spec, buffer))
 
+    # Group derivative specs by key so they can be appended after regular values
+    deriv_by_key: dict[str, list[ObservationStreamSpec]] = {}
+    for spec in (deriv_specs or []):
+        deriv_by_key.setdefault(spec.key, []).append(spec)
+
+    # Union of all keys (regular + derivative)
+    all_keys = list(dict.fromkeys(list(by_key) + list(deriv_by_key)))
+
     frame: dict[str, Any] = {}
 
-    for key, items in by_key.items():
-        first_spec = items[0][0]
+    for key in all_keys:
+        items = by_key.get(key, [])
+        d_specs = deriv_by_key.get(key, [])
+
+        # Determine the first available spec to classify the key type
+        first_spec = items[0][0] if items else d_specs[0]
 
         if isinstance(first_spec, ObservationStreamSpec) and first_spec.is_image:
             # Image: single value (no aggregation)
@@ -280,6 +363,16 @@ def _sample_frame(
                     val = np.asarray(val, dtype=np_dtype).flatten()
                 values.append(val)
 
+            # Append pre-computed velocity values (nearest-timestamp lookup)
+            for spec in d_specs:
+                if derivatives and spec.topic in derivatives:
+                    ts_arr, vel_arr = derivatives[spec.topic]
+                    idx = _nearest_idx(ts_arr, tick_ns)
+                    vel = vel_arr[idx, :len(spec.names)].astype(np_dtype)
+                else:
+                    vel = np.zeros(len(spec.names), dtype=np_dtype)
+                values.append(vel)
+
             frame[key] = np.concatenate(values) if len(values) > 1 else values[0]
 
     return frame
@@ -300,9 +393,15 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
     storage_id = info.get('storage_identifier', 'mcap')
     prompt = _read_prompt(meta)
 
+    # Open storage file directly when available (avoids metadata.yaml format issues)
+    bag_files = list(bag_dir.glob(f'*.{storage_id}')) or list(bag_dir.glob('*.mcap'))
+    uri = str(bag_files[0]) if bag_files else str(bag_dir)
+    if bag_files:
+        storage_id = bag_files[0].suffix.lstrip('.')
+
     reader = rosbag2_py.SequentialReader()
     reader.open(
-        rosbag2_py.StorageOptions(uri=str(bag_dir), storage_id=storage_id),
+        rosbag2_py.StorageOptions(uri=uri, storage_id=storage_id),
         rosbag2_py.ConverterOptions(
             input_serialization_format='cdr',
             output_serialization_format='cdr',
@@ -312,30 +411,26 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
     topic_types = _get_topic_types(reader)
     buffers = _build_buffers(specs, topic_types)
 
+    # Pre-compute velocity for derive=true specs
+    deriv_specs = [
+        s for s in specs
+        if isinstance(s, ObservationStreamSpec) and s.derive
+        and s.topic in topic_types
+    ]
+    derivatives = _precompute_derivatives(uri, storage_id, deriv_specs) if deriv_specs else {}
+
     start_ns, end_ns = _get_bag_time_bounds_ns(reader)
     n_frames = max(1, int((end_ns - start_ns) // step_ns) + 1)
 
     current_tick_idx = 0
     current_tick_ns = start_ns
     header_warned: set[str] = set()
+    filled_topics: set[str] = set()
+    required_topics: set[str] = set(buffers.keys())
 
     while reader.has_next():
         topic, data, bag_ns = reader.read_next()
 
-        # Emit frames whose tick time has passed
-        while current_tick_idx < n_frames and bag_ns >= current_tick_ns:
-            frame = _sample_frame(current_tick_ns, buffers)
-            frame['is_first'] = np.array([current_tick_idx == 0], dtype=bool)
-            frame['is_last'] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
-            frame['is_terminal'] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
-            frame['task'] = prompt
-
-            yield frame
-
-            current_tick_idx += 1
-            current_tick_ns = start_ns + current_tick_idx * step_ns
-
-        # Push message to buffer
         if topic in buffers:
             spec, buffer = buffers[topic]
             msg = deserialize_message(data, get_message(spec.msg_type))
@@ -351,13 +446,21 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
             val = decode_value(msg, spec)
             if val is not None:
                 buffer.push(ts, val)
+                filled_topics.add(topic)
 
-    # Emit remaining frames
+        # Emit frames whose tick time has passed
+        all_warm = required_topics.issubset(filled_topics)
+        while current_tick_idx < n_frames and bag_ns >= current_tick_ns:
+            if all_warm:
+                frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
+                frame['task'] = prompt
+                yield frame
+            current_tick_idx += 1
+            current_tick_ns = start_ns + current_tick_idx * step_ns
+
+    # Emit remaining frames 
     while current_tick_idx < n_frames:
-        frame = _sample_frame(current_tick_ns, buffers)
-        frame['is_first'] = np.array([current_tick_idx == 0], dtype=bool)
-        frame['is_last'] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
-        frame['is_terminal'] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
+        frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
         frame['task'] = prompt
 
         yield frame
