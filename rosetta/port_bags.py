@@ -607,7 +607,6 @@ def main():
         "--repo-id", type=str, default=None,
         help="HuggingFace repository ID (e.g., my_org/my_dataset). Defaults to raw-dir name."
     )
-    parser.add_argument('--contract', type=Path, required=True, help='Rosetta contract YAML path')
     parser.add_argument(
         "--contract", type=Path, required=True,
         help="Rosetta contract YAML path"
