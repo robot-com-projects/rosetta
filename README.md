@@ -7,7 +7,7 @@
   <img src="https://img.shields.io/badge/python-3.10+-blue" alt="Python 3.10+">
 </p> -->
 
-**Rosetta** brings [LeRobot](https://github.com/huggingface/lerobot) to ROS2 robots. 
+**Rosetta** brings [LeRobot](https://github.com/huggingface/lerobot) to ROS2 robots.
 
 ## Table of Contents
 
@@ -108,9 +108,8 @@ ros2 launch rosetta episode_recorder_launch.py contract_path:=contract.yaml
 ```
 
 ```bash
-# Terminal 2: Trigger recording
-ros2 action send_goal /episode_recorder/record_episode \
-    rosetta_interfaces/action/RecordEpisode "{prompt: 'pick up red block'}"
+# Terminal 2: Keyboard controller (r=start, s=save, d=discard, t=set prompt, q=quit)
+ros2 run rosetta episode_keyboard_node
 ```
 
 > **How many episodes?** Plan on recording **50–200+ demonstrations** depending on task complexity. More diverse, high-quality demonstrations tend to produce better policies. For practical data collection tips, see [Collecting Your Dataset](https://abenstirling.com/lerobot/) and [Improving Your Robotics AI Model](https://docs.phospho.ai/learn/improve-robotics-ai-model).
@@ -296,11 +295,52 @@ The `episode_recorder_node` is a convenience node that records contract-specifie
 ros2 launch rosetta episode_recorder_launch.py contract_path:=/path/to/contract.yaml
 ```
 
-Trigger recording:
+### Controlling Recording
+
+#### Option A — Keyboard controller (recommended)
+
+The `episode_keyboard_node` lets you start, stop, and discard episodes with single key presses. Run it in a **second terminal** while the recorder is running:
+
+```bash
+ros2 run rosetta episode_keyboard_node
+```
+
+Or via launch (supports optional arguments):
+
+```bash
+ros2 launch rosetta episode_keyboard_launch.py \
+    default_prompt:="pick up the cube"
+```
+
+| Key | Action |
+|-----|--------|
+| `r` / `→` | Start recording |
+| `s` / `←` | Stop and save |
+| `d` / `⌫` | Discard episode (stop + delete bag) |
+| `t` | Edit task prompt for the next episode |
+| `h` / `?` | Help |
+| `q` | Quit |
+
+Launch arguments for `episode_keyboard_launch.py`:
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `recorder_ns` | `/episode_recorder` | Namespace of the recorder node |
+| `default_prompt` | `` | Initial task prompt used when starting recordings |
+
+#### Option B — ROS2 action
+
+For scripted or automated workflows, trigger recording directly via the action interface:
 
 ```bash
 ros2 action send_goal /episode_recorder/record_episode \
     rosetta_interfaces/action/RecordEpisode "{prompt: 'task description'}"
+```
+
+Stop by sending `Ctrl-C` to the `send_goal` command, or via the cancel service:
+
+```bash
+ros2 service call /episode_recorder/cancel_recording std_srvs/srv/Trigger
 ```
 
 **Parameters** (all available as launch arguments):
@@ -387,7 +427,7 @@ python -m rosetta.port_bags \
     --root ./datasets/lerobot
 ```
 
- For additional information on large-scale conversions, parallel processing, and SLURM cluster workflows, see the **[LeRobot Porting Datasets Guide](https://huggingface.co/docs/lerobot/en/porting_datasets_v3)** and substitute `port_bags.py` for `port_droid.py` in the examples. 
+ For additional information on large-scale conversions, parallel processing, and SLURM cluster workflows, see the **[LeRobot Porting Datasets Guide](https://huggingface.co/docs/lerobot/en/porting_datasets_v3)** and substitute `port_bags.py` for `port_droid.py` in the examples.
 
 
 
@@ -656,9 +696,31 @@ signals:
 
 For VLA policies, the `task` string can also be provided via the `prompt` argument when recording or running a policy, so you don't need a ROS2 topic for it.
 
+### Topic Recording
+
+By default, the episode recorder records **every topic** on the ROS2 graph, not just those declared in the contract. Contract topics (observations, actions, etc.) are required to be present, but everything else is captured automatically so you never lose data you might need later. This behaves like `ros2 bag record -a`.
+
+To exclude topics, pass the `exclude_topics` parameter to the recorder node.
+
+```python
+# In a launch file
+Node(
+    package='rosetta',
+    executable='episode_recorder_node',
+    parameters=[{
+        'contract_path': '/path/to/contract.yaml',
+        'exclude_topics': ['/camera/.*/debug', '/diagnostics'],
+    }],
+)
+```
+
+Only `/rosout`, `/parameter_events`, and the recorder's own service topics are excluded automatically.
+
+To disable auto-recording and only record contract-declared topics, set `record_all: false` in the contract.
+
 ### Adjunct Topics
 
-Adjunct topics are recorded to the bag file but have no LeRobot feature mapping. Use them for data you want preserved alongside your demonstrations but that isn't part of the training dataset: diagnostics, TF trees, debug streams, extra sensors.
+Adjunct topics are recorded to the bag file but have no LeRobot feature mapping. Unlike auto-discovered topics, adjunct topics are considered **required** to be present at record time.
 
 ```yaml
 adjunct:
