@@ -319,6 +319,8 @@ def _sample_frame(
             val = buffer.sample(tick_ns)
             if val is None:
                 frame[key] = zeros_for_spec(spec)
+            elif isinstance(val, (bytes, bytearray)):
+                frame[key] = val
             else:
                 frame[key] = np.asarray(val, dtype=np.uint8)
         elif isinstance(first_spec, ObservationStreamSpec) and first_spec.dtype == 'string':
@@ -426,6 +428,7 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], task: str = 
     header_warned: set[str] = set()
     filled_topics: set[str] = set()
     required_topics: set[str] = set(buffers.keys())
+    key_formats: dict[str, str] = {}  # output key -> format string (e.g. 'jpeg', 'png')
 
     while reader.has_next():
         topic, data, bag_ns = reader.read_next()
@@ -442,10 +445,28 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], task: str = 
                     bag_dir.name,
                 )
                 header_warned.add(spec.key)
-            val = decode_value(msg, spec)
-            if val is not None:
-                buffer.push(ts, val)
-                filled_topics.add(topic)
+            if isinstance(spec, ObservationStreamSpec) and spec.is_image:
+                if spec.msg_type == 'sensor_msgs/msg/CompressedImage':
+                    # Push raw bytes — no decode, format sniffed or read from msg.format
+                    raw = bytes(msg.data)
+                    if raw:
+                        if topic not in filled_topics:
+                            print(f'[DEBUG] Obtained compressed topic: {topic} ({len(raw)} bytes)')
+                        if spec.key not in key_formats and hasattr(msg, 'format') and msg.format:
+                            key_formats[spec.key] = msg.format
+                        buffer.push(ts, raw)
+                        filled_topics.add(topic)
+                else:
+                    # Uncompressed image (sensor_msgs/msg/Image) — decode to numpy array (resize in decoder)
+                    val = decode_value(msg, spec)
+                    if val is not None:
+                        buffer.push(ts, val)
+                        filled_topics.add(topic)
+            else:
+                val = decode_value(msg, spec)
+                if val is not None:
+                    buffer.push(ts, val)
+                    filled_topics.add(topic)
 
         # Emit frames whose tick time has passed
         all_warm = required_topics.issubset(filled_topics)
@@ -453,7 +474,7 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], task: str = 
             if all_warm:
                 frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
                 frame['task'] = task
-                yield frame
+                yield frame, key_formats
             current_tick_idx += 1
             current_tick_ns = start_ns + current_tick_idx * step_ns
 
@@ -461,8 +482,7 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], task: str = 
     while current_tick_idx < n_frames:
         frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
         frame['task'] = task
-
-        yield frame
+        yield frame, key_formats
 
         current_tick_idx += 1
         current_tick_ns = start_ns + current_tick_idx * step_ns
@@ -536,6 +556,19 @@ def port_bags(
         defer_video_encoding=False,
         batch_encoding_size=batch_encoding_size,
     )
+    # Build per-camera resize map for CompressedImage keys only.
+    # sensor_msgs/msg/Image keys are already resized by the decoder; bytes keys are passthrough
+    # and need encode_video_frames to apply the resize.
+    per_key_resize = {
+        spec.key: {'target_size': tuple(spec.image_resize)}
+        for spec in specs
+        if isinstance(spec, ObservationStreamSpec)
+        and spec.is_image
+        and spec.image_resize
+        and spec.msg_type == 'sensor_msgs/msg/CompressedImage'
+    }
+    if per_key_resize:
+        lerobot_dataset.per_key_encoding_kwargs = per_key_resize
 
     start_time = time.time()
     num_episodes = len(bag_dirs)
@@ -563,8 +596,8 @@ def port_bags(
                     )
 
             frame_count = 0
-            for frame in _stream_frames_from_bag(bag_dir, specs):
-                lerobot_dataset.add_frame(frame)
+            for frame, key_formats in _stream_frames_from_bag(bag_dir, specs, task=episode_task):
+                lerobot_dataset.add_frame_bytes(frame, format=key_formats or None)
                 frame_count += 1
 
             lerobot_dataset.save_episode()
