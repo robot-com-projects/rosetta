@@ -74,7 +74,7 @@ from .common.ros2_utils import get_message_timestamp_ns
 # Bag metadata keys
 BAG_METADATA_KEY = 'rosbag2_bagfile_information'
 BAG_CUSTOM_DATA_KEY = 'custom_data'
-BAG_PROMPT_KEY = 'lerobot.operator_prompt'
+BAG_TASK_KEY = 'task'
 
 # ---------- Bag discovery ----------
 
@@ -101,13 +101,13 @@ def _read_bag_metadata(bag_dir: Path) -> dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def _read_prompt(meta: dict[str, Any]) -> str:
-    """Read prompt from metadata custom_data."""
+def _read_task(meta: dict[str, Any]) -> str | None:
+    """Read task from metadata custom_data. Returns None if not found."""
     info = meta.get(BAG_METADATA_KEY, {})
     custom_data = info.get(BAG_CUSTOM_DATA_KEY, {})
     if isinstance(custom_data, dict):
-        return custom_data.get(BAG_PROMPT_KEY, '')
-    return ''
+        return custom_data.get(BAG_TASK_KEY) or None
+    return None
 
 
 def _get_topic_types(reader: rosbag2_py.SequentialReader) -> dict[str, str]:
@@ -378,7 +378,7 @@ def _sample_frame(
     return frame
 
 
-def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
+def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], task: str = ''):
     """
     Stream LeRobot frames from a bag file.
 
@@ -391,7 +391,6 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
     meta = _read_bag_metadata(bag_dir)
     info = meta.get(BAG_METADATA_KEY, {})
     storage_id = info.get('storage_identifier', 'mcap')
-    prompt = _read_prompt(meta)
 
     # Open storage file directly when available (avoids metadata.yaml format issues)
     bag_files = list(bag_dir.glob(f'*.{storage_id}')) or list(bag_dir.glob('*.mcap'))
@@ -453,7 +452,7 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
         while current_tick_idx < n_frames and bag_ns >= current_tick_ns:
             if all_warm:
                 frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
-                frame['task'] = prompt
+                frame['task'] = task
                 yield frame
             current_tick_idx += 1
             current_tick_ns = start_ns + current_tick_idx * step_ns
@@ -461,7 +460,7 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
     # Emit remaining frames 
     while current_tick_idx < n_frames:
         frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
-        frame['task'] = prompt
+        frame['task'] = task
 
         yield frame
 
@@ -477,6 +476,7 @@ def port_bags(
     repo_id: str,
     contract_path: Path,
     root: Path | None = None,
+    task: str | None = None,
     push_to_hub: bool = False,
     num_shards: int | None = None,
     shard_index: int | None = None,
@@ -491,6 +491,8 @@ def port_bags(
         repo_id: HuggingFace repository ID (e.g., "my_org/my_dataset").
         contract_path: Path to Rosetta contract YAML.
         root: Output directory for dataset. Defaults to ~/.cache/huggingface/lerobot.
+        task: Task description string. If None, reads the 'task' field from each bag's
+            metadata.yaml custom_data. Raises if no task can be found for a bag.
         push_to_hub: Whether to upload to HuggingFace Hub after porting.
         num_shards: Total number of shards for parallel processing.
         shard_index: Index of this shard (0 to num_shards-1).
@@ -550,6 +552,16 @@ def port_bags(
         )
 
         try:
+            if task is not None:
+                episode_task = task
+            else:
+                episode_task = _read_task(_read_bag_metadata(bag_dir))
+                if episode_task is None:
+                    raise RuntimeError(
+                        f"No task defined for {bag_dir.name}. "
+                        f"Add 'task' to custom_data in metadata.yaml or pass --task."
+                    )
+
             frame_count = 0
             for frame in _stream_frames_from_bag(bag_dir, specs):
                 lerobot_dataset.add_frame(frame)
@@ -620,6 +632,10 @@ def main():
         help="Upload to HuggingFace Hub after porting"
     )
     parser.add_argument(
+        "--task", type=str, default=None,
+        help="Task description for all episodes. If omitted, reads 'task' from each bag's metadata.yaml custom_data."
+    )
+    parser.add_argument(
         "--num-shards", type=int, default=None,
         help="Total number of shards for parallel processing"
     )
@@ -671,6 +687,7 @@ def main():
             repo_id=repo_id,
             contract_path=args.contract,
             root=args.root,
+            task=args.task,
             push_to_hub=args.push_to_hub,
             num_shards=args.num_shards,
             shard_index=args.shard_index,
