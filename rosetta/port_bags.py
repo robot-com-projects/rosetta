@@ -261,7 +261,6 @@ def _precompute_derivatives(
         velocities = np.gradient(positions, median_dt, axis=0)  # central differences
 
         result[topic] = (timestamps, velocities)
-        logging.debug('Precomputed velocity for %s: %d samples, median_dt=%.4fs', topic, len(history), median_dt)
 
     return result
 
@@ -457,8 +456,6 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], prompt: str 
                     # Push raw bytes — no decode, format sniffed or read from msg.format
                     raw = bytes(msg.data)
                     if raw:
-                        if topic not in filled_topics:
-                            print(f'[DEBUG] Obtained compressed topic: {topic} ({len(raw)} bytes)')
                         if spec.key not in key_formats and hasattr(msg, 'format') and msg.format:
                             key_formats[spec.key] = msg.format
                         buffer.push(ts, raw)
