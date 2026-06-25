@@ -526,13 +526,16 @@ def port_bags(
 
     # LeRobot uses root directly as dataset path, so append repo_id
     dataset_root = root / repo_id if root else None
+    _encoding_kwargs = dict(encoding_kwargs or {})
+    vcodec = _encoding_kwargs.pop("vcodec", "libsvtav1")
     lerobot_dataset = LeRobotDataset.create(
         repo_id=repo_id,
         root=dataset_root,
         robot_type=contract.robot_type,
         fps=contract.fps,
         features=features,
-        encoding_kwargs=encoding_kwargs,
+        vcodec=vcodec,
+        encoding_kwargs=_encoding_kwargs or None,
         defer_video_encoding=False,
         batch_encoding_size=batch_encoding_size,
     )
