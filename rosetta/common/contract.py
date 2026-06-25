@@ -141,7 +141,7 @@ class ObservationSpec:
     dtype: str | None = None
     decoder: str | None = None  # Custom decoder path: "module.path:function_name"
     unit_conversion: str | None = None  # "rad2deg" | None
-    derive: bool = False  # differentiate full-rate data via np.gradient
+    differentiate: bool = False  # differentiate full-rate data via np.gradient
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +242,7 @@ class Contract:
     reset: ResetSpec | None = None
     visualization: VisualizationSpec | None = None
     timestamp_source: str = 'receive'
+    converters: tuple[str, ...] = ()
 
 
 # =============================================================================
@@ -276,7 +277,7 @@ class ObservationStreamSpec(StreamSpec):
     namespace: str | None = None
     decoder: str | None = None  # Custom decoder path
     unit_conversion: str | None = None  # "rad2deg" | None
-    derive: bool = False  # differentiate full-rate data via np.gradient
+    differentiate: bool = False  # differentiate full-rate data via np.gradient
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,7 +430,7 @@ def _parse_observation(
         dtype=_validate_dtype(data.get('dtype'), ctx),
         decoder=_validate_converter_path(data.get('decoder'), f'{ctx}.decoder'),
         unit_conversion=uc,
-        derive=bool(data.get('derive', False)),
+        differentiate=bool(data.get('differentiate', False)),
     )
 
 
@@ -691,6 +692,20 @@ def load_contract(path: Path | str) -> Contract:
     if fps <= 0:
         raise ContractValidationError(f'fps must be positive, got {fps}')
 
+    # Import converter modules before parsing specs so their @register_decoder /
+    # @register_encoder decorators fire and populate the global registries.
+    converters_raw = data.get('converters') or []
+    if isinstance(converters_raw, str):
+        converters_raw = [converters_raw]
+    converters: tuple[str, ...] = tuple(converters_raw)
+    for module_path in converters:
+        try:
+            importlib.import_module(module_path)
+        except ImportError as e:
+            raise ContractValidationError(
+                f"Cannot import converter module '{module_path}': {e}"
+            ) from e
+
     # Parse sections
     observations = [
         _parse_observation(it, i) for i, it in enumerate(data.get('observations') or [])
@@ -738,4 +753,5 @@ def load_contract(path: Path | str) -> Contract:
         reset=_parse_reset(data.get('reset')),
         visualization=_parse_visualization(data.get('visualization')),
         timestamp_source=str(data.get('timestamp_source', 'receive')).lower(),
+        converters=converters,
     )

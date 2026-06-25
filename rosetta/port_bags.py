@@ -74,7 +74,7 @@ from .common.ros2_utils import get_message_timestamp_ns
 # Bag metadata keys
 BAG_METADATA_KEY = 'rosbag2_bagfile_information'
 BAG_CUSTOM_DATA_KEY = 'custom_data'
-BAG_TASK_KEY = 'task'
+BAG_PROMPT_KEY = 'lerobot.operator_prompt'
 
 # ---------- Bag discovery ----------
 
@@ -101,12 +101,12 @@ def _read_bag_metadata(bag_dir: Path) -> dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def _read_task(meta: dict[str, Any]) -> str | None:
-    """Read task from metadata custom_data. Returns None if not found."""
+def _read_prompt(meta: dict[str, Any]) -> str | None:
+    """Read prompt from metadata custom_data. Returns None if not found."""
     info = meta.get(BAG_METADATA_KEY, {})
     custom_data = info.get(BAG_CUSTOM_DATA_KEY, {})
     if isinstance(custom_data, dict):
-        return custom_data.get(BAG_TASK_KEY) or None
+        return custom_data.get(BAG_PROMPT_KEY) or None
     return None
 
 
@@ -135,7 +135,7 @@ def _build_buffers(
             continue
 
         # Derivative specs are handled by _precompute_derivatives, not StreamBuffer
-        if isinstance(spec, ObservationStreamSpec) and spec.derive:
+        if isinstance(spec, ObservationStreamSpec) and spec.differentiate:
             continue
 
         if isinstance(spec, ObservationStreamSpec):
@@ -176,8 +176,6 @@ def _build_features(specs: list[StreamSpec]) -> dict[str, dict[str, Any]]:
             features[key] = build_feature(first)
         else:
             # Numeric: aggregate names from all specs
-            if dtype == 'float64':
-                dtype = 'float32'
             all_names = []
             for spec in key_specs:
                 all_names.extend(spec.names if spec.names else get_namespaced_names(spec))
@@ -271,7 +269,7 @@ def _precompute_derivatives(
 # Map LeRobot dtype strings to numpy dtypes
 DTYPE_MAP = {
     'float32': np.float32,
-    'float64': np.float32, # visualizer has issues with float64
+    'float64': np.float64,
     'int32': np.int32,
     'int64': np.int64,
     'bool': bool,
@@ -288,7 +286,7 @@ def _sample_frame(
     Sample a single frame from buffers at the given tick time.
 
     Specs sharing the same key are aggregated (concatenated in insertion order).
-    Derivative specs (derive='true') are looked up from pre-computed arrays
+    Derivative specs (differentiate='true') are looked up from pre-computed arrays
     and appended after regular buffer values for the same key.
     """
     # Group by output key, preserving insertion order
@@ -380,7 +378,7 @@ def _sample_frame(
     return frame
 
 
-def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], task: str = ''):
+def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], prompt: str = ''):
     """
     Stream LeRobot frames from a bag file.
 
@@ -412,10 +410,10 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], task: str = 
     topic_types = _get_topic_types(reader)
     buffers = _build_buffers(specs, topic_types)
 
-    # Pre-compute velocity for derive=true specs
+    # Pre-compute velocity for differentiate=true specs
     deriv_specs = [
         s for s in specs
-        if isinstance(s, ObservationStreamSpec) and s.derive
+        if isinstance(s, ObservationStreamSpec) and s.differentiate
         and s.topic in topic_types
     ]
     derivatives = _precompute_derivatives(uri, storage_id, deriv_specs) if deriv_specs else {}
@@ -432,6 +430,15 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], task: str = 
 
     while reader.has_next():
         topic, data, bag_ns = reader.read_next()
+
+        all_warm = required_topics.issubset(filled_topics)
+        while current_tick_idx < n_frames and bag_ns >= current_tick_ns:
+            if all_warm: # Only emit frames after all required topics have been filled at least once
+                frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
+                frame['task'] = prompt
+                yield frame
+            current_tick_idx += 1
+            current_tick_ns = start_ns + current_tick_idx * step_ns
 
         if topic in buffers:
             spec, buffer = buffers[topic]
@@ -496,7 +503,7 @@ def port_bags(
     repo_id: str,
     contract_path: Path,
     root: Path | None = None,
-    task: str | None = None,
+    prompt: str | None = None,
     push_to_hub: bool = False,
     num_shards: int | None = None,
     shard_index: int | None = None,
@@ -511,8 +518,8 @@ def port_bags(
         repo_id: HuggingFace repository ID (e.g., "my_org/my_dataset").
         contract_path: Path to Rosetta contract YAML.
         root: Output directory for dataset. Defaults to ~/.cache/huggingface/lerobot.
-        task: Task description string. If None, reads the 'task' field from each bag's
-            metadata.yaml custom_data. Raises if no task can be found for a bag.
+        prompt: Prompt string. If None, reads the prompt from each bag's
+            metadata.yaml custom_data. Raises if no prompt can be found for a bag.
         push_to_hub: Whether to upload to HuggingFace Hub after porting.
         num_shards: Total number of shards for parallel processing.
         shard_index: Index of this shard (0 to num_shards-1).
@@ -546,13 +553,16 @@ def port_bags(
 
     # LeRobot uses root directly as dataset path, so append repo_id
     dataset_root = root / repo_id if root else None
+    _encoding_kwargs = dict(encoding_kwargs or {})
+    vcodec = _encoding_kwargs.pop("vcodec", "libsvtav1")
     lerobot_dataset = LeRobotDataset.create(
         repo_id=repo_id,
         root=dataset_root,
         robot_type=contract.robot_type,
         fps=contract.fps,
         features=features,
-        encoding_kwargs=encoding_kwargs,
+        vcodec=vcodec,
+        encoding_kwargs=_encoding_kwargs or None,
         defer_video_encoding=False,
         batch_encoding_size=batch_encoding_size,
     )
@@ -585,18 +595,18 @@ def port_bags(
         )
 
         try:
-            if task is not None:
-                episode_task = task
+            if prompt is not None:
+                episode_prompt = prompt
             else:
-                episode_task = _read_task(_read_bag_metadata(bag_dir))
-                if episode_task is None:
+                episode_prompt = _read_prompt(_read_bag_metadata(bag_dir))
+                if episode_prompt is None:
                     raise RuntimeError(
-                        f"No task defined for {bag_dir.name}. "
-                        f"Add 'task' to custom_data in metadata.yaml or pass --task."
+                        f"No prompt defined for {bag_dir.name}. "
+                        f"Add prompt to custom_data in metadata.yaml or pass --prompt."
                     )
 
             frame_count = 0
-            for frame, key_formats in _stream_frames_from_bag(bag_dir, specs, task=episode_task):
+            for frame, key_formats in _stream_frames_from_bag(bag_dir, specs, prompt=episode_prompt):
                 lerobot_dataset.add_frame_bytes(frame, format=key_formats or None)
                 frame_count += 1
 
@@ -665,8 +675,8 @@ def main():
         help="Upload to HuggingFace Hub after porting"
     )
     parser.add_argument(
-        "--task", type=str, default=None,
-        help="Task description for all episodes. If omitted, reads 'task' from each bag's metadata.yaml custom_data."
+        "--prompt", type=str, default=None,
+        help="Prompt for all episodes. If omitted, reads the prompt from each bag's metadata.yaml custom_data."
     )
     parser.add_argument(
         "--num-shards", type=int, default=None,
@@ -720,7 +730,7 @@ def main():
             repo_id=repo_id,
             contract_path=args.contract,
             root=args.root,
-            task=args.task,
+            prompt=args.prompt,
             push_to_hub=args.push_to_hub,
             num_shards=args.num_shards,
             shard_index=args.shard_index,
