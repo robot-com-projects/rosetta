@@ -141,7 +141,7 @@ class ObservationSpec:
     dtype: str | None = None
     decoder: str | None = None  # Custom decoder path: "module.path:function_name"
     unit_conversion: str | None = None  # "rad2deg" | None
-    derive: bool = False  # differentiate full-rate data via np.gradient
+    differentiate: bool = False  # differentiate full-rate data via np.gradient
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,7 +277,7 @@ class ObservationStreamSpec(StreamSpec):
     namespace: str | None = None
     decoder: str | None = None  # Custom decoder path
     unit_conversion: str | None = None  # "rad2deg" | None
-    derive: bool = False  # differentiate full-rate data via np.gradient
+    differentiate: bool = False  # differentiate full-rate data via np.gradient
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,7 +430,7 @@ def _parse_observation(
         dtype=_validate_dtype(data.get('dtype'), ctx),
         decoder=_validate_converter_path(data.get('decoder'), f'{ctx}.decoder'),
         unit_conversion=uc,
-        derive=bool(data.get('derive', False)),
+        differentiate=bool(data.get('differentiate', False)),
     )
 
 
