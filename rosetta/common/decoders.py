@@ -304,6 +304,7 @@ def _dec_joint_state(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
 
     return np.asarray(out, dtype=np.float64)
 
+
 # =============================================================================
 # IMU Decoder
 # =============================================================================
