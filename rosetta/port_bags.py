@@ -176,8 +176,6 @@ def _build_features(specs: list[StreamSpec]) -> dict[str, dict[str, Any]]:
             features[key] = build_feature(first)
         else:
             # Numeric: aggregate names from all specs
-            if dtype == 'float64':
-                dtype = 'float32'
             all_names = []
             for spec in key_specs:
                 all_names.extend(spec.names if spec.names else get_namespaced_names(spec))
@@ -271,7 +269,7 @@ def _precompute_derivatives(
 # Map LeRobot dtype strings to numpy dtypes
 DTYPE_MAP = {
     'float32': np.float32,
-    'float64': np.float32, # visualizer has issues with float64
+    'float64': np.float64,
     'int32': np.int32,
     'int64': np.int64,
     'bool': bool,
