@@ -428,6 +428,15 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], prompt: str 
     while reader.has_next():
         topic, data, bag_ns = reader.read_next()
 
+        all_warm = required_topics.issubset(filled_topics)
+        while current_tick_idx < n_frames and bag_ns >= current_tick_ns:
+            if all_warm: # Only emit frames after all required topics have been filled at least once
+                frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
+                frame['task'] = prompt
+                yield frame
+            current_tick_idx += 1
+            current_tick_ns = start_ns + current_tick_idx * step_ns
+
         if topic in buffers:
             spec, buffer = buffers[topic]
             msg = deserialize_message(data, get_message(spec.msg_type))
@@ -444,16 +453,6 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], prompt: str 
             if val is not None:
                 buffer.push(ts, val)
                 filled_topics.add(topic)
-
-        # Emit frames whose tick time has passed
-        all_warm = required_topics.issubset(filled_topics)
-        while current_tick_idx < n_frames and bag_ns >= current_tick_ns:
-            if all_warm:
-                frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
-                frame['task'] = prompt
-                yield frame
-            current_tick_idx += 1
-            current_tick_ns = start_ns + current_tick_idx * step_ns
 
     # Emit remaining frames 
     while current_tick_idx < n_frames:
