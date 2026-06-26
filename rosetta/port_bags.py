@@ -45,6 +45,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import logging
 from pathlib import Path
 import time
@@ -60,6 +61,17 @@ import yaml
 
 from .common import decoders as _decoders  # noqa: F401, E402
 from .common import encoders as _encoders  # noqa: F401, E402
+
+# Auto-discover and load converter plugins declared via 'rosetta.converters' entry points.
+# @register_decoder / @register_encoder decorators in each plugin fire on load.
+for _ep in importlib.metadata.entry_points(group='rosetta.converters'):
+    try:
+        _ep.load()
+    except ImportError as _ep_err:
+        logging.warning(
+            'Could not load rosetta converter plugin %r: %s',
+            _ep.name, _ep_err
+        )
 from .common.contract import load_contract, ObservationStreamSpec, StreamSpec
 from .common.contract_utils import (
     build_feature,
