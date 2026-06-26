@@ -45,6 +45,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import logging
 from pathlib import Path
 import time
@@ -60,6 +61,17 @@ import yaml
 
 from .common import decoders as _decoders  # noqa: F401, E402
 from .common import encoders as _encoders  # noqa: F401, E402
+
+# Auto-discover and load converter plugins declared via 'rosetta.converters' entry points.
+# @register_decoder / @register_encoder decorators in each plugin fire on load.
+for _ep in importlib.metadata.entry_points(group='rosetta.converters'):
+    try:
+        _ep.load()
+    except ImportError as _ep_err:
+        logging.warning(
+            'Could not load rosetta converter plugin %r: %s',
+            _ep.name, _ep_err
+        )
 from .common.contract import load_contract, ObservationStreamSpec, StreamSpec
 from .common.contract_utils import (
     build_feature,
@@ -101,13 +113,13 @@ def _read_bag_metadata(bag_dir: Path) -> dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def _read_prompt(meta: dict[str, Any]) -> str:
-    """Read prompt from metadata custom_data."""
+def _read_prompt(meta: dict[str, Any]) -> str | None:
+    """Read prompt from metadata custom_data. Returns None if not found."""
     info = meta.get(BAG_METADATA_KEY, {})
     custom_data = info.get(BAG_CUSTOM_DATA_KEY, {})
     if isinstance(custom_data, dict):
-        return custom_data.get(BAG_PROMPT_KEY, '')
-    return ''
+        return custom_data.get(BAG_PROMPT_KEY) or None
+    return None
 
 
 def _get_topic_types(reader: rosbag2_py.SequentialReader) -> dict[str, str]:
@@ -132,6 +144,10 @@ def _build_buffers(
     for spec in specs:
         if spec.topic not in topic_types:
             logging.warning('Topic %s not in bag, skipping %s', spec.topic, spec.key)
+            continue
+
+        # Derivative specs are handled by _precompute_derivatives, not StreamBuffer
+        if isinstance(spec, ObservationStreamSpec) and spec.differentiate:
             continue
 
         if isinstance(spec, ObservationStreamSpec):
@@ -174,18 +190,13 @@ def _build_features(specs: list[StreamSpec]) -> dict[str, dict[str, Any]]:
             # Numeric: aggregate names from all specs
             all_names = []
             for spec in key_specs:
-                all_names.extend(get_namespaced_names(spec))
+                all_names.extend(spec.names if spec.names else get_namespaced_names(spec))
             n = len(all_names) or 1
             features[key] = {
                 'dtype': dtype,
                 'shape': (n,),
                 'names': all_names if all_names else None,
             }
-
-    # Frame boundary markers
-    features['is_first'] = {'dtype': 'bool', 'shape': (1,), 'names': None}
-    features['is_last'] = {'dtype': 'bool', 'shape': (1,), 'names': None}
-    features['is_terminal'] = {'dtype': 'bool', 'shape': (1,), 'names': None}
 
     return features
 
@@ -201,6 +212,71 @@ def _get_bag_time_bounds_ns(reader: rosbag2_py.SequentialReader) -> tuple[int, i
     return start_ns, start_ns + duration_ns
 
 
+def _nearest_idx(timestamps: np.ndarray, t: int) -> int:
+    """Return index of the timestamp in `timestamps` nearest to `t`."""
+    idx = np.searchsorted(timestamps, t)
+    if idx == 0:
+        return 0
+    if idx == len(timestamps):
+        return len(timestamps) - 1
+    return idx - 1 if abs(timestamps[idx - 1] - t) <= abs(timestamps[idx] - t) else idx
+
+
+def _precompute_derivatives(
+    uri: str,
+    storage_id: str,
+    deriv_specs: list[ObservationStreamSpec],
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """First pass: collect full-rate position data and compute velocity via np.gradient.
+
+    np.gradient(positions, median_dt, axis=0)
+    where median_dt = median of positive inter-sample intervals in seconds.
+
+    Returns {topic: (timestamps_ns, velocities)} where velocities has shape (N, D).
+    """
+    topic_to_spec = {s.topic: s for s in deriv_specs}
+    topic_history: dict[str, list[tuple[int, np.ndarray]]] = {s.topic: [] for s in deriv_specs}
+
+    reader = rosbag2_py.SequentialReader()
+    reader.open(
+        rosbag2_py.StorageOptions(uri=uri, storage_id=storage_id),
+        rosbag2_py.ConverterOptions(
+            input_serialization_format='cdr',
+            output_serialization_format='cdr',
+        ),
+    )
+
+    while reader.has_next():
+        topic, data, bag_ns = reader.read_next()
+        if topic not in topic_history:
+            continue
+        spec = topic_to_spec[topic]
+        msg = deserialize_message(data, get_message(spec.msg_type))
+        ts, _ = get_message_timestamp_ns(msg, spec, bag_ns)
+        val = decode_value(msg, spec)
+        if val is not None:
+            topic_history[topic].append((ts, np.asarray(val, dtype=np.float64).flatten()))
+
+    result: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for topic, history in topic_history.items():
+        if len(history) < 2:
+            logging.warning('Not enough samples for derivative on topic %s (%d)', topic, len(history))
+            continue
+        timestamps = np.array([h[0] for h in history], dtype=np.float64)
+        positions = np.stack([h[1] for h in history])  # (N, D)
+
+        dts_s = np.diff(timestamps) / 1e9
+        pos_dts = dts_s[dts_s > 0]
+        if pos_dts.size == 0:
+            continue
+        median_dt = float(np.median(pos_dts))
+        velocities = np.gradient(positions, median_dt, axis=0)  # central differences
+
+        result[topic] = (timestamps, velocities)
+
+    return result
+
+
 # Map LeRobot dtype strings to numpy dtypes
 DTYPE_MAP = {
     'float32': np.float32,
@@ -214,21 +290,37 @@ DTYPE_MAP = {
 def _sample_frame(
     tick_ns: int,
     buffers: dict[str, tuple[StreamSpec, StreamBuffer]],
+    deriv_specs: list[ObservationStreamSpec] | None = None,
+    derivatives: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> dict[str, Any]:
     """
     Sample a single frame from buffers at the given tick time.
 
     Specs sharing the same key are aggregated (concatenated in insertion order).
+    Derivative specs (differentiate='true') are looked up from pre-computed arrays
+    and appended after regular buffer values for the same key.
     """
     # Group by output key, preserving insertion order
     by_key: dict[str, list[tuple[StreamSpec, StreamBuffer]]] = {}
     for spec, buffer in buffers.values():
         by_key.setdefault(spec.key, []).append((spec, buffer))
 
+    # Group derivative specs by key so they can be appended after regular values
+    deriv_by_key: dict[str, list[ObservationStreamSpec]] = {}
+    for spec in (deriv_specs or []):
+        deriv_by_key.setdefault(spec.key, []).append(spec)
+
+    # Union of all keys (regular + derivative)
+    all_keys = list(dict.fromkeys(list(by_key) + list(deriv_by_key)))
+
     frame: dict[str, Any] = {}
 
-    for key, items in by_key.items():
-        first_spec = items[0][0]
+    for key in all_keys:
+        items = by_key.get(key, [])
+        d_specs = deriv_by_key.get(key, [])
+
+        # Determine the first available spec to classify the key type
+        first_spec = items[0][0] if items else d_specs[0]
 
         if isinstance(first_spec, ObservationStreamSpec) and first_spec.is_image:
             # Image: single value (no aggregation)
@@ -236,6 +328,8 @@ def _sample_frame(
             val = buffer.sample(tick_ns)
             if val is None:
                 frame[key] = zeros_for_spec(spec)
+            elif isinstance(val, (bytes, bytearray)):
+                frame[key] = val
             else:
                 frame[key] = np.asarray(val, dtype=np.uint8)
         elif isinstance(first_spec, ObservationStreamSpec) and first_spec.dtype == 'string':
@@ -280,12 +374,22 @@ def _sample_frame(
                     val = np.asarray(val, dtype=np_dtype).flatten()
                 values.append(val)
 
+            # Append pre-computed velocity values (nearest-timestamp lookup)
+            for spec in d_specs:
+                if derivatives and spec.topic in derivatives:
+                    ts_arr, vel_arr = derivatives[spec.topic]
+                    idx = _nearest_idx(ts_arr, tick_ns)
+                    vel = vel_arr[idx, :len(spec.names)].astype(np_dtype)
+                else:
+                    vel = np.zeros(len(spec.names), dtype=np_dtype)
+                values.append(vel)
+
             frame[key] = np.concatenate(values) if len(values) > 1 else values[0]
 
     return frame
 
 
-def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
+def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], prompt: str = ''):
     """
     Stream LeRobot frames from a bag file.
 
@@ -298,11 +402,16 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
     meta = _read_bag_metadata(bag_dir)
     info = meta.get(BAG_METADATA_KEY, {})
     storage_id = info.get('storage_identifier', 'mcap')
-    prompt = _read_prompt(meta)
+
+    # Open storage file directly when available (avoids metadata.yaml format issues)
+    bag_files = list(bag_dir.glob(f'*.{storage_id}')) or list(bag_dir.glob('*.mcap'))
+    uri = str(bag_files[0]) if bag_files else str(bag_dir)
+    if bag_files:
+        storage_id = bag_files[0].suffix.lstrip('.')
 
     reader = rosbag2_py.SequentialReader()
     reader.open(
-        rosbag2_py.StorageOptions(uri=str(bag_dir), storage_id=storage_id),
+        rosbag2_py.StorageOptions(uri=uri, storage_id=storage_id),
         rosbag2_py.ConverterOptions(
             input_serialization_format='cdr',
             output_serialization_format='cdr',
@@ -312,30 +421,36 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
     topic_types = _get_topic_types(reader)
     buffers = _build_buffers(specs, topic_types)
 
+    # Pre-compute velocity for differentiate=true specs
+    deriv_specs = [
+        s for s in specs
+        if isinstance(s, ObservationStreamSpec) and s.differentiate
+        and s.topic in topic_types
+    ]
+    derivatives = _precompute_derivatives(uri, storage_id, deriv_specs) if deriv_specs else {}
+
     start_ns, end_ns = _get_bag_time_bounds_ns(reader)
     n_frames = max(1, int((end_ns - start_ns) // step_ns) + 1)
 
     current_tick_idx = 0
     current_tick_ns = start_ns
     header_warned: set[str] = set()
+    filled_topics: set[str] = set()
+    required_topics: set[str] = set(buffers.keys())
+    key_formats: dict[str, str] = {}  # output key -> format string (e.g. 'jpeg', 'png')
 
     while reader.has_next():
         topic, data, bag_ns = reader.read_next()
 
-        # Emit frames whose tick time has passed
+        all_warm = required_topics.issubset(filled_topics)
         while current_tick_idx < n_frames and bag_ns >= current_tick_ns:
-            frame = _sample_frame(current_tick_ns, buffers)
-            frame['is_first'] = np.array([current_tick_idx == 0], dtype=bool)
-            frame['is_last'] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
-            frame['is_terminal'] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
-            frame['task'] = prompt
-
-            yield frame
-
+            if all_warm: # Only emit frames after all required topics have been filled at least once
+                frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
+                frame['task'] = prompt
+                yield frame, key_formats
             current_tick_idx += 1
             current_tick_ns = start_ns + current_tick_idx * step_ns
 
-        # Push message to buffer
         if topic in buffers:
             spec, buffer = buffers[topic]
             msg = deserialize_message(data, get_message(spec.msg_type))
@@ -348,19 +463,33 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
                     bag_dir.name,
                 )
                 header_warned.add(spec.key)
-            val = decode_value(msg, spec)
-            if val is not None:
-                buffer.push(ts, val)
+            if isinstance(spec, ObservationStreamSpec) and spec.is_image:
+                if spec.msg_type == 'sensor_msgs/msg/CompressedImage':
+                    # Push raw bytes — no decode, format sniffed or read from msg.format
+                    raw = bytes(msg.data)
+                    if raw:
+                        if spec.key not in key_formats and hasattr(msg, 'format') and msg.format:
+                            key_formats[spec.key] = msg.format
+                        buffer.push(ts, raw)
+                        filled_topics.add(topic)
+                else:
+                    # Uncompressed image (sensor_msgs/msg/Image) — decode to numpy array (resize in decoder)
+                    val = decode_value(msg, spec)
+                    if val is not None:
+                        buffer.push(ts, val)
+                        filled_topics.add(topic)
+            else:
+                val = decode_value(msg, spec)
+                if val is not None:
+                    buffer.push(ts, val)
+                    filled_topics.add(topic)
 
-    # Emit remaining frames
+
+    # Emit remaining frames 
     while current_tick_idx < n_frames:
-        frame = _sample_frame(current_tick_ns, buffers)
-        frame['is_first'] = np.array([current_tick_idx == 0], dtype=bool)
-        frame['is_last'] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
-        frame['is_terminal'] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
+        frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
         frame['task'] = prompt
-
-        yield frame
+        yield frame, key_formats
 
         current_tick_idx += 1
         current_tick_ns = start_ns + current_tick_idx * step_ns
@@ -374,6 +503,7 @@ def port_bags(
     repo_id: str,
     contract_path: Path,
     root: Path | None = None,
+    prompt: str | None = None,
     push_to_hub: bool = False,
     num_shards: int | None = None,
     shard_index: int | None = None,
@@ -388,6 +518,8 @@ def port_bags(
         repo_id: HuggingFace repository ID (e.g., "my_org/my_dataset").
         contract_path: Path to Rosetta contract YAML.
         root: Output directory for dataset. Defaults to ~/.cache/huggingface/lerobot.
+        prompt: Prompt string. If None, reads the prompt from each bag's
+            metadata.yaml custom_data. Raises if no prompt can be found for a bag.
         push_to_hub: Whether to upload to HuggingFace Hub after porting.
         num_shards: Total number of shards for parallel processing.
         shard_index: Index of this shard (0 to num_shards-1).
@@ -421,16 +553,32 @@ def port_bags(
 
     # LeRobot uses root directly as dataset path, so append repo_id
     dataset_root = root / repo_id if root else None
+    _encoding_kwargs = dict(encoding_kwargs or {})
+    vcodec = _encoding_kwargs.pop("vcodec", "libsvtav1")
     lerobot_dataset = LeRobotDataset.create(
         repo_id=repo_id,
         root=dataset_root,
         robot_type=contract.robot_type,
         fps=contract.fps,
         features=features,
-        encoding_kwargs=encoding_kwargs,
+        vcodec=vcodec,
+        encoding_kwargs=_encoding_kwargs or None,
         defer_video_encoding=False,
         batch_encoding_size=batch_encoding_size,
     )
+    # Build per-camera resize map for CompressedImage keys only.
+    # sensor_msgs/msg/Image keys are already resized by the decoder; bytes keys are passthrough
+    # and need encode_video_frames to apply the resize.
+    per_key_resize = {
+        spec.key: {'target_size': tuple(spec.image_resize)}
+        for spec in specs
+        if isinstance(spec, ObservationStreamSpec)
+        and spec.is_image
+        and spec.image_resize
+        and spec.msg_type == 'sensor_msgs/msg/CompressedImage'
+    }
+    if per_key_resize:
+        lerobot_dataset.per_key_encoding_kwargs = per_key_resize
 
     start_time = time.time()
     num_episodes = len(bag_dirs)
@@ -447,9 +595,19 @@ def port_bags(
         )
 
         try:
+            if prompt is not None:
+                episode_prompt = prompt
+            else:
+                episode_prompt = _read_prompt(_read_bag_metadata(bag_dir))
+                if episode_prompt is None:
+                    raise RuntimeError(
+                        f"No prompt defined for {bag_dir.name}. "
+                        f"Add prompt to custom_data in metadata.yaml or pass --prompt."
+                    )
+
             frame_count = 0
-            for frame in _stream_frames_from_bag(bag_dir, specs):
-                lerobot_dataset.add_frame(frame)
+            for frame, key_formats in _stream_frames_from_bag(bag_dir, specs, prompt=episode_prompt):
+                lerobot_dataset.add_frame_bytes(frame, format=key_formats or None)
                 frame_count += 1
 
             lerobot_dataset.save_episode()
@@ -504,7 +662,6 @@ def main():
         "--repo-id", type=str, default=None,
         help="HuggingFace repository ID (e.g., my_org/my_dataset). Defaults to raw-dir name."
     )
-    parser.add_argument('--contract', type=Path, required=True, help='Rosetta contract YAML path')
     parser.add_argument(
         "--contract", type=Path, required=True,
         help="Rosetta contract YAML path"
@@ -516,6 +673,10 @@ def main():
     parser.add_argument(
         "--push-to-hub", action="store_true",
         help="Upload to HuggingFace Hub after porting"
+    )
+    parser.add_argument(
+        "--prompt", type=str, default=None,
+        help="Prompt for all episodes. If omitted, reads the prompt from each bag's metadata.yaml custom_data."
     )
     parser.add_argument(
         "--num-shards", type=int, default=None,
@@ -569,6 +730,7 @@ def main():
             repo_id=repo_id,
             contract_path=args.contract,
             root=args.root,
+            prompt=args.prompt,
             push_to_hub=args.push_to_hub,
             num_shards=args.num_shards,
             shard_index=args.shard_index,
