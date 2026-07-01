@@ -45,11 +45,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import importlib.metadata
+import io
 import logging
 from pathlib import Path
 import time
 from typing import Any
+
+from PIL import Image as PILImage
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.utils import get_elapsed_time_in_days_hours_minutes_seconds
@@ -62,16 +64,6 @@ import yaml
 from .common import decoders as _decoders  # noqa: F401, E402
 from .common import encoders as _encoders  # noqa: F401, E402
 
-# Auto-discover and load converter plugins declared via 'rosetta.converters' entry points.
-# @register_decoder / @register_encoder decorators in each plugin fire on load.
-for _ep in importlib.metadata.entry_points(group='rosetta.converters'):
-    try:
-        _ep.load()
-    except ImportError as _ep_err:
-        logging.warning(
-            'Could not load rosetta converter plugin %r: %s',
-            _ep.name, _ep_err
-        )
 from .common.contract import load_contract, ObservationStreamSpec, StreamSpec
 from .common.contract_utils import (
     build_feature,
@@ -120,6 +112,58 @@ def _read_prompt(meta: dict[str, Any]) -> str | None:
     if isinstance(custom_data, dict):
         return custom_data.get(BAG_PROMPT_KEY) or None
     return None
+
+
+def _peek_compressed_image_sizes(
+    bag_dir: Path,
+    specs: list[ObservationStreamSpec],
+) -> dict[str, tuple[int, int]]:
+    """Return actual (height, width) for each CompressedImage spec in bag_dir.
+
+    Stops as soon as every topic has been seen once.
+
+    If a topic is not found or its payload can't be parsed, it is omitted from
+    the result so the caller falls back to scheduling a resize for it.
+    """
+    topic_to_key: dict[str, str] = {spec.topic: spec.key for spec in specs}
+    remaining: set[str] = set(topic_to_key)
+    sizes: dict[str, tuple[int, int]] = {}
+
+    meta = _read_bag_metadata(bag_dir)
+    info = meta.get(BAG_METADATA_KEY, {})
+    storage_id = info.get('storage_identifier', 'mcap')
+    bag_files = list(bag_dir.glob(f'*.{storage_id}')) or list(bag_dir.glob('*.mcap'))
+    uri = str(bag_files[0]) if bag_files else str(bag_dir)
+    if bag_files:
+        storage_id = bag_files[0].suffix.lstrip('.')
+
+    reader = rosbag2_py.SequentialReader()
+    reader.open(
+        rosbag2_py.StorageOptions(uri=uri, storage_id=storage_id),
+        rosbag2_py.ConverterOptions(
+            input_serialization_format='cdr',
+            output_serialization_format='cdr',
+        ),
+    )
+
+    compressed_image_msg_type = get_message('sensor_msgs/msg/CompressedImage')
+
+    while reader.has_next() and remaining:
+        topic, data, _ = reader.read_next()
+        if topic not in remaining:
+            continue
+        try:
+            msg = deserialize_message(data, compressed_image_msg_type)
+            raw = bytes(msg.data)
+            if not raw:
+                continue
+            pil_img = PILImage.open(io.BytesIO(raw))
+            sizes[topic_to_key[topic]] = (pil_img.height, pil_img.width)
+        except Exception:
+            pass
+        remaining.discard(topic)
+
+    return sizes
 
 
 def _get_topic_types(reader: rosbag2_py.SequentialReader) -> dict[str, str]:
@@ -509,6 +553,7 @@ def port_bags(
     shard_index: int | None = None,
     encoding_kwargs: dict | None = None,
     batch_encoding_size: int = 1,
+    image_writer_threads: int = 8,
 ):
     """
     Port ROS2 bags to LeRobot dataset format.
@@ -526,6 +571,8 @@ def port_bags(
         encoding_kwargs: Keyword arguments forwarded to ``encode_video_frames``
             (e.g. vcodec, pix_fmt, g, crf, fast_decode).
         batch_encoding_size: Number of episodes per encoding batch. Defaults to 1 for immediate encoding.
+        image_writer_threads: Number of image-writer threads for parallel frame writes.
+            Set to 0 to disable the thread pool.
     """
     contract = load_contract(contract_path)
     specs = list(iter_specs(contract))
@@ -563,19 +610,30 @@ def port_bags(
         features=features,
         vcodec=vcodec,
         encoding_kwargs=_encoding_kwargs or None,
-        defer_video_encoding=False,
         batch_encoding_size=batch_encoding_size,
+        image_writer_threads=image_writer_threads,
     )
     # Build per-camera resize map for CompressedImage keys only.
     # sensor_msgs/msg/Image keys are already resized by the decoder; bytes keys are passthrough
     # and need encode_video_frames to apply the resize.
-    per_key_resize = {
-        spec.key: {'target_size': tuple(spec.image_resize)}
-        for spec in specs
+    # Peek at the first bag to get actual frame dimensions — skip the ffmpeg resize
+    # filter entirely for cameras that already publish at the contract target size.
+    compressed_image_specs = [
+        spec for spec in specs
         if isinstance(spec, ObservationStreamSpec)
         and spec.is_image
         and spec.image_resize
         and spec.msg_type == 'sensor_msgs/msg/CompressedImage'
+    ]
+    actual_sizes = (
+        _peek_compressed_image_sizes(bag_dirs[0], compressed_image_specs)
+        if compressed_image_specs
+        else {}
+    )
+    per_key_resize = {
+        spec.key: {'target_size': tuple(spec.image_resize)}
+        for spec in compressed_image_specs
+        if actual_sizes.get(spec.key) != tuple(spec.image_resize)
     }
     if per_key_resize:
         lerobot_dataset.per_key_encoding_kwargs = per_key_resize
@@ -585,56 +643,63 @@ def port_bags(
     successful = 0
     failed: list[tuple[Path, str]] = []
 
-    for episode_index, bag_dir in enumerate(bag_dirs):
+    try:
+        for episode_index, bag_dir in enumerate(bag_dirs):
+            elapsed_time = time.time() - start_time
+            d, h, m, s = get_elapsed_time_in_days_hours_minutes_seconds(elapsed_time)
+
+            logging.info(
+                f'{episode_index} / {num_episodes} episodes processed '
+                f'(after {d} days, {h} hours, {m} minutes, {s:.3f} seconds)'
+            )
+
+            try:
+                if prompt is not None:
+                    episode_prompt = prompt
+                else:
+                    episode_prompt = _read_prompt(_read_bag_metadata(bag_dir))
+                    if episode_prompt is None:
+                        raise RuntimeError(
+                            f"No prompt defined for {bag_dir.name}. "
+                            f"Add prompt to custom_data in metadata.yaml or pass --prompt."
+                        )
+
+                frame_count = 0
+                for frame, key_formats in _stream_frames_from_bag(bag_dir, specs, prompt=episode_prompt):
+                    lerobot_dataset.add_frame_bytes(frame, format=key_formats or None)
+                    frame_count += 1
+
+                lerobot_dataset.save_episode()
+                successful += 1
+                logging.info('  -> %d frames from %s', frame_count, bag_dir.name)
+
+            except Exception as e:
+                failed.append((bag_dir, str(e)))
+                logging.error('  -> FAILED %s: %s', bag_dir.name, e)
+                continue
+
         elapsed_time = time.time() - start_time
         d, h, m, s = get_elapsed_time_in_days_hours_minutes_seconds(elapsed_time)
-
         logging.info(
-            f'{episode_index} / {num_episodes} episodes processed '
-            f'(after {d} days, {h} hours, {m} minutes, {s:.3f} seconds)'
+            f'\nCompleted: {successful}/{num_episodes} episodes '
+            f'({len(failed)} failed) in {d}d {h}h {m}m {s:.1f}s'
         )
 
-        try:
-            if prompt is not None:
-                episode_prompt = prompt
-            else:
-                episode_prompt = _read_prompt(_read_bag_metadata(bag_dir))
-                if episode_prompt is None:
-                    raise RuntimeError(
-                        f"No prompt defined for {bag_dir.name}. "
-                        f"Add prompt to custom_data in metadata.yaml or pass --prompt."
-                    )
+        if failed:
+            logging.warning('Failed bags:')
+            for bag_dir, error in failed:
+                logging.warning('  - %s: %s', bag_dir.name, error)
 
-            frame_count = 0
-            for frame, key_formats in _stream_frames_from_bag(bag_dir, specs, prompt=episode_prompt):
-                lerobot_dataset.add_frame_bytes(frame, format=key_formats or None)
-                frame_count += 1
+        if successful == 0:
+            raise RuntimeError(f'All {num_episodes} bags failed to convert')
 
-            lerobot_dataset.save_episode()
-            successful += 1
-            logging.info('  -> %d frames from %s', frame_count, bag_dir.name)
-
-        except Exception as e:
-            failed.append((bag_dir, str(e)))
-            logging.error('  -> FAILED %s: %s', bag_dir.name, e)
-            continue
-
-    elapsed_time = time.time() - start_time
-    d, h, m, s = get_elapsed_time_in_days_hours_minutes_seconds(elapsed_time)
-    logging.info(
-        f'\nCompleted: {successful}/{num_episodes} episodes '
-        f'({len(failed)} failed) in {d}d {h}h {m}m {s:.1f}s'
-    )
-
-    if failed:
-        logging.warning('Failed bags:')
-        for bag_dir, error in failed:
-            logging.warning('  - %s: %s', bag_dir.name, error)
-
-    if successful == 0:
-        raise RuntimeError(f'All {num_episodes} bags failed to convert')
-
-    lerobot_dataset.finalize()
+        lerobot_dataset.finalize()
+    finally:
+        # LeRobotDataset.create(image_writer_threads=...) starts daemon writer
+        # threads that are never joined otherwise. Stop them so repeated
+        # in-process conversions don't leak ~8 threads each.
+        if lerobot_dataset.writer is not None:
+            lerobot_dataset.writer.stop_image_writer()
 
     if push_to_hub:
         lerobot_dataset.push_to_hub(
