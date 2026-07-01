@@ -772,6 +772,10 @@ def main():
         "--fast-decode", type=int, default=None,
         help="Fast-decode tuning flag (default: 0, codec-dependent)."
     )
+    parser.add_argument(
+        "--image-writer-threads", type=int, default=8,
+        help="Number of image-writer threads for parallel frame writes (default: 8). Set to 0 to disable."
+    )
 
     args = parser.parse_args()
 
@@ -800,6 +804,7 @@ def main():
             num_shards=args.num_shards,
             shard_index=args.shard_index,
             encoding_kwargs=encoding_kwargs or None,
+            image_writer_threads=args.image_writer_threads,
         )
     except KeyboardInterrupt:
         logging.info('\nInterrupted by user')
