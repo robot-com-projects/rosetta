@@ -694,10 +694,8 @@ def port_bags(
             raise RuntimeError(f'All {num_episodes} bags failed to convert')
 
         lerobot_dataset.finalize()
-    finally:
-        # LeRobotDataset.create(image_writer_threads=...) starts daemon writer
-        # threads that are never joined otherwise. Stop them so repeated
-        # in-process conversions don't leak ~8 threads each.
+    finally: # Ensure image writer is stopped even if an exception occurs
+
         if lerobot_dataset.writer is not None:
             lerobot_dataset.writer.stop_image_writer()
 
