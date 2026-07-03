@@ -29,7 +29,6 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-from rosidl_runtime_py.utilities import get_message
 
 from .contract import ActionStreamSpec
 from .converters import register_encoder
@@ -73,6 +72,8 @@ def _enc_twist(action_vec: np.ndarray, spec: ActionStreamSpec, stamp_ns: int | N
     if not spec.names:
         raise ValueError("Twist encoder requires selector.names (e.g., ['linear.x', 'angular.z'])")
 
+    from rosidl_runtime_py.utilities import get_message
+
     msg_cls = get_message('geometry_msgs/msg/Twist')
     msg = msg_cls()
 
@@ -107,6 +108,8 @@ def _enc_twist_stamped(
             "TwistStamped encoder requires selector.names (e.g., ['linear.x', 'angular.z'])"
         )
 
+    from rosidl_runtime_py.utilities import get_message
+
     msg_cls = get_message('geometry_msgs/msg/TwistStamped')
     msg = msg_cls()
     _set_header_stamp(msg, stamp_ns)
@@ -134,6 +137,8 @@ def _enc_float32(
 ) -> Any:
     """Encode to std_msgs/Float32 (scalar)."""
     _ = stamp_ns  # Unused - message type has no header
+    from rosidl_runtime_py.utilities import get_message
+
     msg_cls = get_message('std_msgs/msg/Float32')
     msg = msg_cls()
     arr = _apply_clamp(np.asarray(action_vec, dtype=np.float32).flatten(), spec.clamp)
@@ -147,6 +152,8 @@ def _enc_float64(
 ) -> Any:
     """Encode to std_msgs/Float64 (scalar)."""
     _ = stamp_ns  # Unused - message type has no header
+    from rosidl_runtime_py.utilities import get_message
+
     msg_cls = get_message('std_msgs/msg/Float64')
     msg = msg_cls()
     arr = _apply_clamp(np.asarray(action_vec, dtype=np.float64).flatten(), spec.clamp)
@@ -165,6 +172,8 @@ def _enc_float32_array(
 ) -> Any:
     """Encode to std_msgs/Float32MultiArray."""
     _ = stamp_ns  # Unused - message type has no header
+    from rosidl_runtime_py.utilities import get_message
+
     msg_cls = get_message('std_msgs/msg/Float32MultiArray')
     msg = msg_cls()
 
@@ -180,6 +189,8 @@ def _enc_float64_array(
 ) -> Any:
     """Encode to std_msgs/Float64MultiArray."""
     _ = stamp_ns  # Unused - message type has no header
+    from rosidl_runtime_py.utilities import get_message
+
     msg_cls = get_message('std_msgs/msg/Float64MultiArray')
     msg = msg_cls()
 
@@ -195,6 +206,8 @@ def _enc_int32_array(
 ) -> Any:
     """Encode to std_msgs/Int32MultiArray."""
     _ = stamp_ns  # Unused - message type has no header
+    from rosidl_runtime_py.utilities import get_message
+
     msg_cls = get_message('std_msgs/msg/Int32MultiArray')
     msg = msg_cls()
 
@@ -221,6 +234,8 @@ def _enc_joint_state(
     Without names:
       - Maps action vector to positions with auto-generated names
     """
+    from rosidl_runtime_py.utilities import get_message
+
     msg_cls = get_message('sensor_msgs/msg/JointState')
     msg = msg_cls()
     _set_header_stamp(msg, stamp_ns)
@@ -304,6 +319,8 @@ def _enc_joint_trajectory(
       position / positions, velocity / velocities,
       acceleration / accelerations, effort
     """
+    from rosidl_runtime_py.utilities import get_message
+
     traj_cls = get_message('trajectory_msgs/msg/JointTrajectory')
     point_cls = get_message('trajectory_msgs/msg/JointTrajectoryPoint')
     msg = traj_cls()
@@ -386,6 +403,8 @@ def _enc_joy(action_vec: np.ndarray, spec: ActionStreamSpec, stamp_ns: int | Non
     Button values are rounded to the nearest integer.
     Selector syntax: "<field>.<index>" where field is "axes" or "buttons".
     """
+    from rosidl_runtime_py.utilities import get_message
+
     msg_cls = get_message('sensor_msgs/msg/Joy')
     msg = msg_cls()
     _set_header_stamp(msg, stamp_ns)
@@ -456,6 +475,8 @@ def _enc_multidof_command(
       - Maps action vector to values with auto-generated names
     """
     _ = stamp_ns  # Unused - message type has no header
+    from rosidl_runtime_py.utilities import get_message
+
     msg_cls = get_message('control_msgs/msg/MultiDOFCommand')
     msg = msg_cls()
 
