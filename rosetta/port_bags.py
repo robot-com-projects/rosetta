@@ -610,6 +610,7 @@ def port_bags(
         encoding_kwargs=_encoding_kwargs or None,
         batch_encoding_size=batch_encoding_size,
         image_writer_threads=image_writer_threads,
+        # defer_video_encoding=False,  # param removed in newer lerobot; immediate encoding is default now
     )
     # Build per-camera resize map for CompressedImage keys only.
     # sensor_msgs/msg/Image keys are already resized by the decoder; bytes keys are passthrough
@@ -634,7 +635,7 @@ def port_bags(
         if actual_sizes.get(spec.key) != tuple(spec.image_resize)
     }
     if per_key_resize:
-        lerobot_dataset.per_key_encoding_kwargs = per_key_resize
+        lerobot_dataset.writer.per_key_encoding_kwargs = per_key_resize
 
     start_time = time.time()
     num_episodes = len(bag_dirs)
