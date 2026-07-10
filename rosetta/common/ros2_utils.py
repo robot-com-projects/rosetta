@@ -12,19 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ROS2 utilities: QoS profiles, message field access, timestamp helpers.
-
-QoS-related functions require rclpy (installed with ROS2) and import it lazily
-so that the timestamp/field-access helpers can be used in offline contexts without a ROS2 installation.
-"""
+"""ROS2 utilities: QoS profiles, message field access, timestamp helpers."""
 
 from __future__ import annotations
 
 import os
 from typing import Any, TYPE_CHECKING
 
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    LivelinessPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
+
 if TYPE_CHECKING:
-    from rclpy.qos import QoSProfile
     from .contract import ObservationStreamSpec
 
 
@@ -43,8 +46,6 @@ def qos_profile_from_dict(d: dict[str, Any] | None) -> QoSProfile | None:
     - durability: "volatile" (default) or "transient_local"
     - depth: int (default 10)
     """
-    from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-
     if not d:
         return None
 
@@ -132,8 +133,6 @@ def extract_qos_numeric_values(q: QoSProfile | int) -> dict[str, int]:
         All values are integers matching RMW QoS policy constants.
 
     """
-    from rclpy.qos import DurabilityPolicy, HistoryPolicy, LivelinessPolicy, ReliabilityPolicy
-
     if isinstance(q, int):
         # Just depth provided, use common defaults
         return {
@@ -178,7 +177,6 @@ def is_transient_local(qos: QoSProfile | int) -> bool:
         return False
 
     try:
-        from rclpy.qos import DurabilityPolicy
         return qos.durability == DurabilityPolicy.TRANSIENT_LOCAL
     except Exception:
         return False

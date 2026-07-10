@@ -56,47 +56,13 @@ from PIL import Image as PILImage
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.utils import get_elapsed_time_in_days_hours_minutes_seconds
 import numpy as np
-from contextlib import contextmanager
-from rosbags.highlevel import AnyReader
-from rosbags.typesys import get_typestore, get_types_from_msg, Stores
+from rclpy.serialization import deserialize_message
+import rosbag2_py
+from rosidl_runtime_py.utilities import get_message
 import yaml
 
 from .common import decoders as _decoders  # noqa: F401, E402
 from .common import encoders as _encoders  # noqa: F401, E402
-
-# ---------- Typestore ----------
-def _build_typestore(connections) -> Any:
-    """Build a rosbags typestore, adding custom types from bag connections.
-
-    Standard ROS2 types (sensor_msgs, geometry_msgs, etc.) come from Stores.LATEST.
-    Custom types are parsed from MCAP-embedded schema definitions when the rosbags internal parser is available.
-    """
-    typestore = get_typestore(Stores.LATEST)
-    add_types: dict = {}
-    for conn in connections:
-        if conn.msgtype in typestore.fielddefs:
-            continue
-        msgdef = getattr(conn, 'msgdef', None)
-        if not msgdef:
-            continue
-        # AnyReader connections expose msgdef as an object with a .data string;
-        # BagReader connections expose it as bytes or a plain string.
-        if hasattr(msgdef, 'data'):
-            msgdef = msgdef.data
-        elif isinstance(msgdef, bytes):
-            msgdef = msgdef.decode('utf-8', errors='replace')
-        try:
-            parsed = get_types_from_msg(msgdef, conn.msgtype)
-            add_types.update(parsed)
-        except Exception:
-            logging.debug(
-                'Cannot register custom type %s from embedded schema; '
-                'deserialization will fail unless stubs are pre-registered.',
-                conn.msgtype,
-            )
-    if add_types:
-        typestore.register(add_types)
-    return typestore
 
 from .common.contract import load_contract, ObservationStreamSpec, StreamSpec
 from .common.contract_utils import (
@@ -123,16 +89,6 @@ def find_bag_dirs(raw_dir: Path) -> list[Path]:
     if not bag_dirs:
         raise RuntimeError(f'No bag directories found in {raw_dir}')
     return bag_dirs
-
-
-@contextmanager
-def _open_reader(bag_dir: Path):
-    """Open all *.mcap files in bag_dir for reading."""
-    mcap_files = sorted(bag_dir.glob('*.mcap'))
-    if not mcap_files:
-        raise RuntimeError(f'No .mcap files found in {bag_dir}')
-    with AnyReader(mcap_files) as reader:
-        yield reader
 
 
 # ---------- Internal helpers ----------
@@ -171,31 +127,46 @@ def _peek_compressed_image_sizes(
     remaining: set[str] = set(topic_to_key)
     sizes: dict[str, tuple[int, int]] = {}
 
-    with _open_reader(bag_dir) as reader:
-        typestore = _build_typestore(reader.connections)
-        connections = [c for c in reader.connections if c.topic in remaining]
-        for conn, _, rawdata in reader.messages(connections=connections):
-            if conn.topic not in remaining:
+    meta = _read_bag_metadata(bag_dir)
+    info = meta.get(BAG_METADATA_KEY, {})
+    storage_id = info.get('storage_identifier', 'mcap')
+    bag_files = list(bag_dir.glob(f'*.{storage_id}')) or list(bag_dir.glob('*.mcap'))
+    uri = str(bag_files[0]) if bag_files else str(bag_dir)
+    if bag_files:
+        storage_id = bag_files[0].suffix.lstrip('.')
+
+    reader = rosbag2_py.SequentialReader()
+    reader.open(
+        rosbag2_py.StorageOptions(uri=uri, storage_id=storage_id),
+        rosbag2_py.ConverterOptions(
+            input_serialization_format='cdr',
+            output_serialization_format='cdr',
+        ),
+    )
+
+    compressed_image_msg_type = get_message('sensor_msgs/msg/CompressedImage')
+
+    while reader.has_next() and remaining:
+        topic, data, _ = reader.read_next()
+        if topic not in remaining:
+            continue
+        try:
+            msg = deserialize_message(data, compressed_image_msg_type)
+            raw = bytes(msg.data)
+            if not raw:
                 continue
-            try:
-                msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
-                raw = bytes(msg.data)
-                if not raw:
-                    continue
-                pil_img = PILImage.open(io.BytesIO(raw))
-                sizes[topic_to_key[conn.topic]] = (pil_img.height, pil_img.width)
-            except Exception:
-                pass
-            remaining.discard(conn.topic)
-            if not remaining:
-                break
+            pil_img = PILImage.open(io.BytesIO(raw))
+            sizes[topic_to_key[topic]] = (pil_img.height, pil_img.width)
+        except Exception:
+            pass
+        remaining.discard(topic)
 
     return sizes
 
 
-def _get_topic_types(connections) -> dict[str, str]:
-    """Get topic -> type mapping from bag connections."""
-    return {c.topic: c.msgtype for c in connections}
+def _get_topic_types(reader: rosbag2_py.SequentialReader) -> dict[str, str]:
+    """Get topic -> type mapping from bag."""
+    return {t.name: t.type for t in reader.get_all_topics_and_types()}
 
 
 def _build_buffers(
@@ -272,9 +243,15 @@ def _build_features(specs: list[StreamSpec]) -> dict[str, dict[str, Any]]:
     return features
 
 
-def _get_bag_time_bounds_ns(reader: Any) -> tuple[int, int]:
-    """Get time bounds from an open rosbags Reader."""
-    return reader.start_time, reader.end_time
+def _get_bag_time_bounds_ns(reader: rosbag2_py.SequentialReader) -> tuple[int, int]:
+    """Get time bounds from bag metadata."""
+    metadata = reader.get_metadata()
+    start_time = metadata.starting_time
+    duration = metadata.duration
+    # rosbag2_py returns Time/Duration objects with .nanoseconds property
+    start_ns = start_time.nanoseconds
+    duration_ns = duration.nanoseconds
+    return start_ns, start_ns + duration_ns
 
 
 def _nearest_idx(timestamps: np.ndarray, t: int) -> int:
@@ -288,9 +265,9 @@ def _nearest_idx(timestamps: np.ndarray, t: int) -> int:
 
 
 def _precompute_derivatives(
-    bag_dir: Path,
+    uri: str,
+    storage_id: str,
     deriv_specs: list[ObservationStreamSpec],
-    typestore: Any,
 ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """First pass: collect full-rate position data and compute velocity via np.gradient.
 
@@ -302,15 +279,25 @@ def _precompute_derivatives(
     topic_to_spec = {s.topic: s for s in deriv_specs}
     topic_history: dict[str, list[tuple[int, np.ndarray]]] = {s.topic: [] for s in deriv_specs}
 
-    with _open_reader(bag_dir) as reader:
-        connections = [c for c in reader.connections if c.topic in topic_history]
-        for conn, bag_ns, rawdata in reader.messages(connections=connections):
-            spec = topic_to_spec[conn.topic]
-            msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
-            ts, _ = get_message_timestamp_ns(msg, spec, bag_ns)
-            val = decode_value(msg, spec)
-            if val is not None:
-                topic_history[conn.topic].append((ts, np.asarray(val, dtype=np.float64).flatten()))
+    reader = rosbag2_py.SequentialReader()
+    reader.open(
+        rosbag2_py.StorageOptions(uri=uri, storage_id=storage_id),
+        rosbag2_py.ConverterOptions(
+            input_serialization_format='cdr',
+            output_serialization_format='cdr',
+        ),
+    )
+
+    while reader.has_next():
+        topic, data, bag_ns = reader.read_next()
+        if topic not in topic_history:
+            continue
+        spec = topic_to_spec[topic]
+        msg = deserialize_message(data, get_message(spec.msg_type))
+        ts, _ = get_message_timestamp_ns(msg, spec, bag_ns)
+        val = decode_value(msg, spec)
+        if val is not None:
+            topic_history[topic].append((ts, np.asarray(val, dtype=np.float64).flatten()))
 
     result: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for topic, history in topic_history.items():
@@ -454,12 +441,26 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], prompt: str 
     fps = specs[0].fps
     step_ns = int(1e9 / fps)
 
-    # First pass: gather metadata (topic types, time bounds, typestore).
-    with _open_reader(bag_dir) as reader:
-        typestore = _build_typestore(reader.connections)
-        topic_types = _get_topic_types(reader.connections)
-        start_ns, end_ns = _get_bag_time_bounds_ns(reader)
+    meta = _read_bag_metadata(bag_dir)
+    info = meta.get(BAG_METADATA_KEY, {})
+    storage_id = info.get('storage_identifier', 'mcap')
 
+    # Open storage file directly when available (avoids metadata.yaml format issues)
+    bag_files = list(bag_dir.glob(f'*.{storage_id}')) or list(bag_dir.glob('*.mcap'))
+    uri = str(bag_files[0]) if bag_files else str(bag_dir)
+    if bag_files:
+        storage_id = bag_files[0].suffix.lstrip('.')
+
+    reader = rosbag2_py.SequentialReader()
+    reader.open(
+        rosbag2_py.StorageOptions(uri=uri, storage_id=storage_id),
+        rosbag2_py.ConverterOptions(
+            input_serialization_format='cdr',
+            output_serialization_format='cdr',
+        ),
+    )
+
+    topic_types = _get_topic_types(reader)
     buffers = _build_buffers(specs, topic_types)
 
     # Pre-compute velocity for differentiate=true specs
@@ -468,8 +469,9 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], prompt: str 
         if isinstance(s, ObservationStreamSpec) and s.differentiate
         and s.topic in topic_types
     ]
-    derivatives = _precompute_derivatives(bag_dir, deriv_specs, typestore) if deriv_specs else {}
+    derivatives = _precompute_derivatives(uri, storage_id, deriv_specs) if deriv_specs else {}
 
+    start_ns, end_ns = _get_bag_time_bounds_ns(reader)
     n_frames = max(1, int((end_ns - start_ns) // step_ns) + 1)
 
     current_tick_idx = 0
@@ -479,52 +481,50 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], prompt: str 
     required_topics: set[str] = set(buffers.keys())
     key_formats: dict[str, str] = {}  # output key -> format string (e.g. 'jpeg', 'png')
 
-    with _open_reader(bag_dir) as reader:
-        connections = [c for c in reader.connections if c.topic in buffers]
-        for conn, bag_ns, rawdata in reader.messages(connections=connections):
-            topic = conn.topic
+    while reader.has_next():
+        topic, data, bag_ns = reader.read_next()
 
-            all_warm = required_topics.issubset(filled_topics)
-            while current_tick_idx < n_frames and bag_ns >= current_tick_ns:
-                if all_warm:  # Only emit frames after all required topics have been filled at least once
-                    frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
-                    frame['task'] = prompt
-                    yield frame, key_formats
-                current_tick_idx += 1
-                current_tick_ns = start_ns + current_tick_idx * step_ns
+        all_warm = required_topics.issubset(filled_topics)
+        while current_tick_idx < n_frames and bag_ns >= current_tick_ns:
+            if all_warm: # Only emit frames after all required topics have been filled at least once
+                frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
+                frame['task'] = prompt
+                yield frame, key_formats
+            current_tick_idx += 1
+            current_tick_ns = start_ns + current_tick_idx * step_ns
 
-            if topic in buffers:
-                spec, buffer = buffers[topic]
-                msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
+        if topic in buffers:
+            spec, buffer = buffers[topic]
+            msg = deserialize_message(data, get_message(spec.msg_type))
 
-                ts, used_fallback = get_message_timestamp_ns(msg, spec, bag_ns)
-                if spec.stamp_src == 'header' and used_fallback and spec.key not in header_warned:
-                    logging.warning(
-                        "Header stamp unavailable for '%s' in %s, using bag receive time",
-                        spec.key,
-                        bag_dir.name,
-                    )
-                    header_warned.add(spec.key)
-                if isinstance(spec, ObservationStreamSpec) and spec.is_image:
-                    if spec.msg_type == 'sensor_msgs/msg/CompressedImage':
-                        # Push raw bytes — no decode, format sniffed or read from msg.format
-                        raw = bytes(msg.data)
-                        if raw:
-                            if spec.key not in key_formats and hasattr(msg, 'format') and msg.format:
-                                key_formats[spec.key] = msg.format
-                            buffer.push(ts, raw)
-                            filled_topics.add(topic)
-                    else:
-                        # Uncompressed image (sensor_msgs/msg/Image) — decode to numpy array
-                        val = decode_value(msg, spec)
-                        if val is not None:
-                            buffer.push(ts, val)
-                            filled_topics.add(topic)
+            ts, used_fallback = get_message_timestamp_ns(msg, spec, bag_ns)
+            if spec.stamp_src == 'header' and used_fallback and spec.key not in header_warned:
+                logging.warning(
+                    "Header stamp unavailable for '%s' in %s, using bag receive time",
+                    spec.key,
+                    bag_dir.name,
+                )
+                header_warned.add(spec.key)
+            if isinstance(spec, ObservationStreamSpec) and spec.is_image:
+                if spec.msg_type == 'sensor_msgs/msg/CompressedImage':
+                    # Push raw bytes — no decode, format sniffed or read from msg.format
+                    raw = bytes(msg.data)
+                    if raw:
+                        if spec.key not in key_formats and hasattr(msg, 'format') and msg.format:
+                            key_formats[spec.key] = msg.format
+                        buffer.push(ts, raw)
+                        filled_topics.add(topic)
                 else:
+                    # Uncompressed image (sensor_msgs/msg/Image) — decode to numpy array (resize in decoder)
                     val = decode_value(msg, spec)
                     if val is not None:
                         buffer.push(ts, val)
                         filled_topics.add(topic)
+            else:
+                val = decode_value(msg, spec)
+                if val is not None:
+                    buffer.push(ts, val)
+                    filled_topics.add(topic)
 
 
     # Emit remaining frames 
@@ -709,7 +709,7 @@ def port_bags(
 
 def main():
     """CLI entry point."""
-    logging.basicConfig(level=logging.INFO, format='%(message)s', force=True)
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
 
     parser = argparse.ArgumentParser(
         description="Port ROS2 bags to LeRobot dataset"
