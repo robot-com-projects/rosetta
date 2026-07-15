@@ -610,7 +610,6 @@ def port_bags(
         encoding_kwargs=_encoding_kwargs or None,
         batch_encoding_size=batch_encoding_size,
         image_writer_threads=image_writer_threads,
-        # defer_video_encoding=False,  # param removed in newer lerobot; immediate encoding is default now
     )
     # Build per-camera resize map for CompressedImage keys only.
     # sensor_msgs/msg/Image keys are already resized by the decoder; bytes keys are passthrough
