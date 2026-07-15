@@ -578,7 +578,7 @@ def port_bags(
         and spec.msg_type == 'sensor_msgs/msg/CompressedImage'
     }
     if per_key_resize:
-        lerobot_dataset.per_key_encoding_kwargs = per_key_resize
+        lerobot_dataset.writer.per_key_encoding_kwargs = per_key_resize
 
     start_time = time.time()
     num_episodes = len(bag_dirs)
