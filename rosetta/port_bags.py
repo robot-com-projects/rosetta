@@ -691,11 +691,14 @@ def port_bags(
         if successful == 0:
             raise RuntimeError(f'All {num_episodes} bags failed to convert')
 
+        if lerobot_dataset.defer_video_encoding:
+            # encode_pending_videos() reads episode metadata back from disk, so the
+            # meta parquet writer must be closed (footer written) before it runs.
+            lerobot_dataset.meta._close_writer()
+            lerobot_dataset.encode_pending_videos()
         lerobot_dataset.finalize()
     finally: # Ensure image writer is stopped even if an exception occurs
-
-        if lerobot_dataset.writer is not None:
-            lerobot_dataset.writer.stop_image_writer()
+        lerobot_dataset.stop_image_writer()
 
     if push_to_hub:
         lerobot_dataset.push_to_hub(
