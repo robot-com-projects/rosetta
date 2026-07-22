@@ -54,6 +54,7 @@ from typing import Any
 from PIL import Image as PILImage
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import SUPPORTED_IMAGE_FORMATS
 from lerobot.utils.utils import get_elapsed_time_in_days_hours_minutes_seconds
 import numpy as np
 from rclpy.serialization import deserialize_message
@@ -79,6 +80,16 @@ from .common.ros2_utils import get_message_timestamp_ns
 BAG_METADATA_KEY = 'rosbag2_bagfile_information'
 BAG_CUSTOM_DATA_KEY = 'custom_data'
 BAG_PROMPT_KEY = 'lerobot.operator_prompt'
+
+
+def _resolve_msg_format(raw_format: str) -> str | None:
+    """Extract a lerobot-recognized codec name from a ROS CompressedImage format string."""
+    lowered = raw_format.lower()
+    for fmt in SUPPORTED_IMAGE_FORMATS:
+        if fmt in lowered:
+            return fmt
+    return None
+
 
 # ---------- Bag discovery ----------
 
@@ -507,11 +518,14 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], prompt: str 
                 header_warned.add(spec.key)
             if isinstance(spec, ObservationStreamSpec) and spec.is_image:
                 if spec.msg_type == 'sensor_msgs/msg/CompressedImage':
-                    # Push raw bytes — no decode, format sniffed or read from msg.format
+                    # Push raw bytes — lerobot sniffs the format from the bytes
+                    # unless we resolve a codec name from msg.format below.
                     raw = bytes(msg.data)
                     if raw:
                         if spec.key not in key_formats and hasattr(msg, 'format') and msg.format:
-                            key_formats[spec.key] = msg.format
+                            resolved = _resolve_msg_format(msg.format)
+                            if resolved is not None:
+                                key_formats[spec.key] = resolved
                         buffer.push(ts, raw)
                         filled_topics.add(topic)
                 else:
