@@ -88,6 +88,31 @@ BAG_METADATA_KEY = 'rosbag2_bagfile_information'
 BAG_CUSTOM_DATA_KEY = 'custom_data'
 BAG_PROMPT_KEY = 'lerobot.operator_prompt'
 
+# LeRobot's image writer only recognizes these bare codec names (see
+# lerobot.datasets.lerobot_dataset.SUPPORTED_IMAGE_FORMATS), not the descriptive
+# image_transport convention ("ORIG_PIXFMT; CODEC compressed [COMPRESSED_PIXFMT]",
+# e.g. "rgb8; jpeg compressed bgr8") that sensor_msgs/CompressedImage.format actually
+# carries on this robot's cameras.
+_LEROBOT_IMAGE_FORMATS = frozenset({'jpeg', 'png', 'webp', 'avif'})
+
+
+def _normalize_compressed_image_format(format_str: str) -> str | None:
+    """
+    Extract a LeRobot-recognized codec name from a CompressedImage format string.
+
+    Returns None if no supported codec can be identified, so the caller can omit
+    the explicit format and let LeRobot sniff it from the data's magic bytes instead.
+    """
+    format_str = format_str.strip().lower()
+    if format_str in _LEROBOT_IMAGE_FORMATS:
+        return format_str
+    # image_transport convention: "<orig_pixfmt>; <codec> compressed [<compressed_pixfmt>]"
+    if ';' in format_str:
+        codec = format_str.split(';', 1)[1].strip().split()[0:1]
+        if codec and codec[0] in _LEROBOT_IMAGE_FORMATS:
+            return codec[0]
+    return None
+
 # ---------- Bag discovery ----------
 
 
@@ -469,7 +494,12 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], prompt: str 
                     raw = bytes(msg.data)
                     if raw:
                         if spec.key not in key_formats and hasattr(msg, 'format') and msg.format:
-                            key_formats[spec.key] = msg.format
+                            normalized = _normalize_compressed_image_format(msg.format)
+                            if normalized is not None:
+                                key_formats[spec.key] = normalized
+                            # else: leave unset — LeRobot sniffs the format from the
+                            # data's magic bytes instead of raising on an unrecognized
+                            # explicit format.
                         buffer.push(ts, raw)
                         filled_topics.add(topic)
                 else:
@@ -563,7 +593,6 @@ def port_bags(
         features=features,
         vcodec=vcodec,
         encoding_kwargs=_encoding_kwargs or None,
-        defer_video_encoding=False,
         batch_encoding_size=batch_encoding_size,
     )
     # Build per-camera resize map for CompressedImage keys only.
@@ -578,8 +607,9 @@ def port_bags(
         and spec.msg_type == 'sensor_msgs/msg/CompressedImage'
     }
     if per_key_resize:
-        lerobot_dataset.per_key_encoding_kwargs = per_key_resize
-
+        # OLD lerobot: `lerobot_dataset.per_key_encoding_kwargs = per_key_resize`
+        # (no `.writer` — that indirection was added by the DatasetWriter refactor).
+        lerobot_dataset.writer.per_key_encoding_kwargs = per_key_resize
     start_time = time.time()
     num_episodes = len(bag_dirs)
     successful = 0
@@ -648,7 +678,7 @@ def port_bags(
 
 def main():
     """CLI entry point."""
-    logging.basicConfig(level=logging.INFO, format='%(message)s')
+    logging.basicConfig(level=logging.INFO, format='%(message)s', force=True)
 
     parser = argparse.ArgumentParser(
         description="Port ROS2 bags to LeRobot dataset"

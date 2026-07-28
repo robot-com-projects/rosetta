@@ -43,6 +43,7 @@ To add a new encoding:
 
 from __future__ import annotations
 
+from fractions import Fraction
 import io
 from typing import Any
 
@@ -57,6 +58,15 @@ try:
 except ImportError:
     cv2 = None  # type: ignore[assignment]
     _HAS_CV2 = False
+
+# Optional PyAV for CompressedVideo (H.264/H.265 stream) decoding.
+try:
+    import av
+
+    _HAS_AV = True
+except ImportError:
+    av = None  # type: ignore[assignment]
+    _HAS_AV = False
 
 from .contract import DEPTH_ENCODINGS, ObservationStreamSpec
 from .converters import register_decoder
@@ -663,3 +673,137 @@ def _dec_string(msg: Any, spec: ObservationStreamSpec) -> str:
     """Decode std_msgs/String to Python string."""
     _ = spec  # Unused
     return str(msg.data)
+
+
+# =============================================================================
+# CompressedVideo Decoder (ffmpeg_image_transport H.264/H.265 stream)
+# =============================================================================
+
+# One stateful PyAV decoder context per topic: unlike CompressedImage (one
+# independent JPEG per message), a video stream needs SPS/PPS and reference-frame
+# state carried across packets to decode anything.
+_video_decoder_state: dict[str, dict[str, Any]] = {}
+
+
+def reset_video_decoder_state() -> None:
+    """Clear cached per-topic CompressedVideo decoder state.
+
+    Must be called between bags/episodes. State here is keyed only by topic
+    name, and two different episodes reusing the same topic name (the normal
+    case) are otherwise indistinguishable to this cache: without a reset, the
+    next episode silently resumes decoding with the previous episode's stale
+    codec context (wrong SPS/PPS, stale reference frames), producing near-100%
+    decode failures with no error surfaced.
+    """
+    _video_decoder_state.clear()
+
+
+_VIDEO_JPEG_QUALITY = 90
+# ffmpeg mjpeg encoder quantizer bounds (2=highest quality, 31=lowest). Fixed
+# low range keeps quality close to _VIDEO_JPEG_QUALITY without rate control
+# overhead - mjpeg here always encodes single, independent frames.
+_VIDEO_MJPEG_QMIN = 2
+_VIDEO_MJPEG_QMAX = 5
+
+
+def _encode_rgb_to_jpeg(img_rgb: np.ndarray, quality: int = _VIDEO_JPEG_QUALITY) -> bytes:
+    """Encode an HWC uint8 RGB array to JPEG bytes. Used only for the black-frame fallback."""
+    buf = io.BytesIO()
+    Image.fromarray(img_rgb).save(buf, format='JPEG', quality=quality)
+    return buf.getvalue()
+
+
+def _make_mjpeg_encoder(resize_h: int, resize_w: int) -> Any:
+    """Create an MJPEG encoder context sized for one topic's output frames."""
+    encoder_ctx = av.codec.CodecContext.create('mjpeg', 'w')
+    encoder_ctx.width = resize_w
+    encoder_ctx.height = resize_h
+    # yuvj420p (full-range YCbCr) matches JFIF's color range; encoding straight
+    # from the decoder's native yuv420p (limited-range, BT.601/BT.709) would
+    # otherwise wash out contrast relative to what to_ndarray('rgb24') gives.
+    encoder_ctx.pix_fmt = 'yuvj420p'
+    encoder_ctx.time_base = Fraction(1, 30)
+    encoder_ctx.options = {'qmin': str(_VIDEO_MJPEG_QMIN), 'qmax': str(_VIDEO_MJPEG_QMAX)}
+    return encoder_ctx
+
+
+@register_decoder('foxglove_msgs/msg/CompressedVideo', dtype='video')
+def _dec_compressed_video(msg: Any, spec: ObservationStreamSpec) -> bytes:
+    """
+    Decode foxglove_msgs/CompressedVideo (ffmpeg_image_transport output) to JPEG bytes.
+
+    The H.264/H.265 packet must still be fully decoded to a raw frame (unlike a
+    single JPEG, a video packet carries no meaning without the decoder's SPS/PPS
+    and reference-frame state) - but the resulting frame is immediately
+    re-encoded to JPEG here so it can flow through the same byte-passthrough
+    path as sensor_msgs/CompressedImage (see port_bags._stream_frames_from_bag),
+    instead of being written to disk as a raw-array PNG and decoded again at
+    final video-encoding time.
+
+    Requires spec.image_resize — unlike a single JPEG, a video packet may decode to
+    zero frames (e.g. waiting for a keyframe), and there is no other way to know the
+    output shape for that tick.
+
+    CAVEAT: this trusts msg.format for the codec name, but at least one
+    ffmpeg_image_transport fork hardcodes msg.format to "h264" regardless of the
+    actual encoder configured (see ffmpeg_encoder.cpp — the line that would set it
+    to the real codec name is commented out). If your recording used a non-h264
+    codec (e.g. libx265), this will silently try to decode it as h264. There is no
+    way to detect that misconfiguration from the message alone.
+    """
+    if not _HAS_AV:
+        raise ImportError(
+            "foxglove_msgs/CompressedVideo decoding requires PyAV ('av'). Install it "
+            "or remove this observation from your contract."
+        )
+    if not spec.image_resize:
+        raise ValueError(
+            f"'{spec.key}' decodes CompressedVideo but has no image.resize in the "
+            f"contract — required to know the output shape before the first frame "
+            f"decodes (or while waiting for a keyframe)."
+        )
+
+    topic = spec.topic
+    resize_h, resize_w = spec.image_resize
+
+    if topic not in _video_decoder_state:
+        codec_name = getattr(msg, 'format', 'h264') or 'h264'
+        _video_decoder_state[topic] = {
+            'codec_ctx': av.codec.CodecContext.create(codec_name, 'r'),
+            'encoder_ctx': _make_mjpeg_encoder(resize_h, resize_w),
+            'last_frame': None,
+        }
+
+    state = _video_decoder_state[topic]
+
+    try:
+        packet = av.packet.Packet(bytes(msg.data))
+        frames = state['codec_ctx'].decode(packet)
+    except Exception:
+        frames = []
+
+    if not frames:
+        # No decodable frame this tick (e.g. still waiting for a keyframe) — hold
+        # the last good frame's JPEG bytes, or a black frame before the first
+        # one ever decodes.
+        if state['last_frame'] is None:
+            black = np.zeros((resize_h, resize_w, 3), dtype=np.uint8)
+            state['last_frame'] = _encode_rgb_to_jpeg(black)
+        return state['last_frame']
+
+    # Resize + pixel-format conversion in a single swscale pass (via reformat),
+    # then encode straight to JPEG from YUV 
+    reformatted = frames[-1].reformat(width=resize_w, height=resize_h, format='yuvj420p')
+    packets = state['encoder_ctx'].encode(reformatted)
+    if not packets:
+        # mjpeg is intra-only with no lookahead; every input frame should yield
+        # exactly one packet immediately. Guard against the unexpected case by
+        # holding the previous frame instead of raising mid-episode.
+        if state['last_frame'] is None:
+            black = np.zeros((resize_h, resize_w, 3), dtype=np.uint8)
+            state['last_frame'] = _encode_rgb_to_jpeg(black)
+        return state['last_frame']
+
+    jpeg_bytes = bytes(packets[0])
+    state['last_frame'] = jpeg_bytes
+    return jpeg_bytes

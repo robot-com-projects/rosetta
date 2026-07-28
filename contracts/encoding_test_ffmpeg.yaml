@@ -1,0 +1,95 @@
+# Test contract for the encoding_test_h264_*/encoding_test_h265_* batch (bitrate/duration
+# sweep: 2M, 10s, 400K, per codec). Validates both decoders against real
+# ffmpeg_image_transport output on the same 6 bags:
+#   - foxglove_msgs/CompressedVideo (rosetta/common/decoders.py::_dec_compressed_video)
+#   - sensor_msgs/CompressedImage (rosetta/common/decoders.py::_dec_compressed_image)
+# Not a real robot contract — only references topics confirmed present (via
+# `ros2 bag info`) in all 6 target bags. CompressedVideo and CompressedImage topics
+# are independent cameras here (not paired 1:1) except where names visibly match.
+
+robot_type: video_encoding_test
+fps: 30
+max_duration_s: 30.0
+
+observations:
+  # --- foxglove_msgs/CompressedVideo (ffmpeg_image_transport H.264/H.265 output) ---
+  - key: observation.images.ffmpeg_head_stereo
+    topic: /head_stereo_cam/image_raw/ffmpeg
+    type: foxglove_msgs/msg/CompressedVideo
+    image:
+      resize: [480, 640]
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: observation.images.ffmpeg_head_rgbd
+    topic: /head_rgbd_cam/image_raw/ffmpeg
+    type: foxglove_msgs/msg/CompressedVideo
+    image:
+      resize: [480, 640]
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: observation.images.ffmpeg_wrist_left
+    topic: /camera_wrist_left/image_raw/ffmpeg
+    type: foxglove_msgs/msg/CompressedVideo
+    image:
+      resize: [480, 640]
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: observation.images.ffmpeg_wrist_right
+    topic: /camera_wrist_right/image_raw/ffmpeg
+    type: foxglove_msgs/msg/CompressedVideo
+    image:
+      resize: [480, 640]
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: observation.images.ffmpeg_main
+    topic: /main_cam/image_raw/ffmpeg
+    type: foxglove_msgs/msg/CompressedVideo
+    image:
+      resize: [480, 640]
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  # --- sensor_msgs/CompressedImage (real astribot_camera JPEG topics) ---
+  - key: observation.images.compressed_head_stereo
+    topic: /astribot_camera/head_stereo/color_compress/compressed
+    type: sensor_msgs/msg/CompressedImage
+    image:
+      resize: [480, 640]
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: observation.images.compressed_head_rgbd
+    topic: /astribot_camera/head_rgbd/color_compress/compressed
+    type: sensor_msgs/msg/CompressedImage
+    image:
+      resize: [480, 640]
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: observation.images.compressed_wrist_left
+    topic: /astribot_camera/left_wrist_rgbd/color_compress/compressed
+    type: sensor_msgs/msg/CompressedImage
+    image:
+      resize: [480, 640]
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: observation.images.compressed_wrist_right
+    topic: /astribot_camera/right_wrist_rgbd/color_compress/compressed
+    type: sensor_msgs/msg/CompressedImage
+    image:
+      resize: [480, 640]
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: observation.images.compressed_torso
+    topic: /astribot_camera/torso_rgbd/color_compress/compressed
+    type: sensor_msgs/msg/CompressedImage
+    image:
+      resize: [480, 640]
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
