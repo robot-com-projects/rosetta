@@ -53,6 +53,7 @@ from typing import Any
 
 from PIL import Image as PILImage
 
+from lerobot.configs.video import VALID_VIDEO_CODECS
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.lerobot_dataset import SUPPORTED_IMAGE_FORMATS
 from lerobot.utils.utils import get_elapsed_time_in_days_hours_minutes_seconds
@@ -614,6 +615,8 @@ def port_bags(
     dataset_root = root / repo_id if root else None
     _encoding_kwargs = dict(encoding_kwargs or {})
     vcodec = _encoding_kwargs.pop("vcodec", "libsvtav1")
+    jpeg_decoder = _encoding_kwargs.pop("jpeg_decoder", None)
+    bitrate = _encoding_kwargs.pop("bitrate", None)
     lerobot_dataset = LeRobotDataset.create(
         repo_id=repo_id,
         root=dataset_root,
@@ -624,7 +627,6 @@ def port_bags(
         encoding_kwargs=_encoding_kwargs or None,
         batch_encoding_size=batch_encoding_size,
         image_writer_threads=image_writer_threads,
-        defer_video_encoding=False,
     )
     # Build per-camera resize map for CompressedImage keys only.
     # sensor_msgs/msg/Image keys are already resized by the decoder; bytes keys are passthrough
@@ -643,13 +645,26 @@ def port_bags(
         if compressed_image_specs
         else {}
     )
-    per_key_resize = {
+    per_key_kwargs: dict[str, dict[str, Any]] = {
         spec.key: {'target_size': tuple(spec.image_resize)}
         for spec in compressed_image_specs
         if actual_sizes.get(spec.key) != tuple(spec.image_resize)
     }
-    if per_key_resize:
-        lerobot_dataset.writer.per_key_encoding_kwargs = per_key_resize
+    # jpeg_decoder selects the JPEG -> encoder-frame route ('libav' decodes straight to
+    # planar YUV, ~4x faster than the PIL RGB round trip; 'pil' restores the old path).
+    # bitrate is what the Jetson hardware encoders use in place of crf. Both apply to every
+    # image stream, including ones that need no resize.
+    extra_encode_kwargs: dict[str, Any] = {}
+    if jpeg_decoder is not None:
+        extra_encode_kwargs['jpeg_decoder'] = jpeg_decoder
+    if bitrate is not None:
+        extra_encode_kwargs['bitrate'] = bitrate
+    if extra_encode_kwargs:
+        for spec in specs:
+            if isinstance(spec, ObservationStreamSpec) and spec.is_image:
+                per_key_kwargs.setdefault(spec.key, {}).update(extra_encode_kwargs)
+    if per_key_kwargs:
+        lerobot_dataset.writer.per_key_encoding_kwargs = per_key_kwargs
 
     start_time = time.time()
     num_episodes = len(bag_dirs)
@@ -707,8 +722,15 @@ def port_bags(
             raise RuntimeError(f'All {num_episodes} bags failed to convert')
 
         lerobot_dataset.finalize()
-    finally: # Ensure image writer is stopped even if an exception occurs
-        lerobot_dataset.stop_image_writer()
+    finally:  # Ensure image writer is stopped even if an exception occurs
+        # lerobot >= ~0.5 moved this onto DatasetWriter (the same refactor that moved
+        # per_key_encoding_kwargs); calling it on the dataset raises AttributeError there.
+        # Handle both so this works against either version.
+        writer = getattr(lerobot_dataset, 'writer', None)
+        if writer is not None:
+            writer.stop_image_writer()
+        elif hasattr(lerobot_dataset, 'stop_image_writer'):
+            lerobot_dataset.stop_image_writer()
 
     if push_to_hub:
         lerobot_dataset.push_to_hub(
@@ -762,8 +784,31 @@ def main():
     )
     parser.add_argument(
         "--vcodec", type=str, default="libsvtav1",
-        choices=["libsvtav1", "libx264", "h264", "hevc", "h264_nvenc"],
-        help="Video codec for encoding (default: libsvtav1). Use libx264/h264 for faster encoding."
+        # Taken from lerobot rather than hardcoded: the accepted set is enforced by
+        # VideoEncoderConfig, and a stale local list silently diverges from it. This
+        # previously offered "libx264", which VideoEncoderConfig rejects outright — the
+        # canonical name is "h264". Also picks up h264_nvmpi / hevc_nvmpi on Jetson builds,
+        # where h264_nvmpi is by far the fastest option and uses --bitrate instead of --crf.
+        choices=sorted(VALID_VIDEO_CODECS),
+        help=(
+            "Video codec for encoding (default: libsvtav1). 'h264' for faster software "
+            "encoding, 'h264_nvmpi' on Jetson for hardware encoding."
+        )
+    )
+    parser.add_argument(
+        "--bitrate", type=str, default=None,
+        help=(
+            "Target bitrate for hardware encoders, FFmpeg style (e.g. '8M'). Used by "
+            "h264_nvmpi / hevc_nvmpi, which have no CRF mode. Ignored by software codecs."
+        )
+    )
+    parser.add_argument(
+        "--jpeg-decoder", type=str, default=None, choices=["libav", "pil"],
+        help=(
+            "How a stored JPEG becomes an encoder frame for CompressedImage streams. "
+            "'libav' (the default in encode_video_frames) decodes straight to planar YUV; "
+            "'pil' uses the older PIL RGB route and is ~4x slower. Benchmarking knob."
+        )
     )
     parser.add_argument(
         "--pix-fmt", type=str, default=None,
@@ -801,6 +846,10 @@ def main():
         encoding_kwargs["crf"] = args.crf
     if args.fast_decode is not None:
         encoding_kwargs["fast_decode"] = args.fast_decode
+    if args.bitrate is not None:
+        encoding_kwargs["bitrate"] = args.bitrate
+    if args.jpeg_decoder is not None:
+        encoding_kwargs["jpeg_decoder"] = args.jpeg_decoder
 
     try:
         port_bags(
