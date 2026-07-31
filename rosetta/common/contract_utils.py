@@ -363,8 +363,9 @@ def iter_observation_specs(contract: Contract) -> Iterable[ObservationStreamSpec
         elif is_image:
             dtype = 'video'
         elif o.decoder:
-            # Custom decoder - default to float64 if not specified
-            dtype = 'float64'
+            # Custom decoder: honour the dtype registered by @register_decoder;
+            # fall back to float64 only when the type is not in the registry.
+            dtype = DTYPES.get(o.type, 'float64')
         else:
             if o.type not in DTYPES:
                 raise ContractValidationError(
