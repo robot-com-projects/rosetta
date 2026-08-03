@@ -615,7 +615,6 @@ def port_bags(
     dataset_root = root / repo_id if root else None
     _encoding_kwargs = dict(encoding_kwargs or {})
     vcodec = _encoding_kwargs.pop("vcodec", "libsvtav1")
-    jpeg_decoder = _encoding_kwargs.pop("jpeg_decoder", None)
     bitrate = _encoding_kwargs.pop("bitrate", None)
     lerobot_dataset = LeRobotDataset.create(
         repo_id=repo_id,
@@ -650,13 +649,9 @@ def port_bags(
         for spec in compressed_image_specs
         if actual_sizes.get(spec.key) != tuple(spec.image_resize)
     }
-    # jpeg_decoder selects the JPEG -> encoder-frame route ('libav' decodes straight to
-    # planar YUV, ~4x faster than the PIL RGB round trip; 'pil' restores the old path).
-    # bitrate is what the Jetson hardware encoders use in place of crf. Both apply to every
+    # bitrate is what the Jetson hardware encoders use in place of crf. Applies to every
     # image stream, including ones that need no resize.
     extra_encode_kwargs: dict[str, Any] = {}
-    if jpeg_decoder is not None:
-        extra_encode_kwargs['jpeg_decoder'] = jpeg_decoder
     if bitrate is not None:
         extra_encode_kwargs['bitrate'] = bitrate
     if extra_encode_kwargs:
@@ -803,14 +798,6 @@ def main():
         )
     )
     parser.add_argument(
-        "--jpeg-decoder", type=str, default=None, choices=["libav", "pil"],
-        help=(
-            "How a stored JPEG becomes an encoder frame for CompressedImage streams. "
-            "'libav' (the default in encode_video_frames) decodes straight to planar YUV; "
-            "'pil' uses the older PIL RGB route and is ~4x slower. Benchmarking knob."
-        )
-    )
-    parser.add_argument(
         "--pix-fmt", type=str, default=None,
         help="Pixel format (default: yuv420p)."
     )
@@ -848,8 +835,6 @@ def main():
         encoding_kwargs["fast_decode"] = args.fast_decode
     if args.bitrate is not None:
         encoding_kwargs["bitrate"] = args.bitrate
-    if args.jpeg_decoder is not None:
-        encoding_kwargs["jpeg_decoder"] = args.jpeg_decoder
 
     try:
         port_bags(
