@@ -649,8 +649,6 @@ def port_bags(
         for spec in compressed_image_specs
         if actual_sizes.get(spec.key) != tuple(spec.image_resize)
     }
-    # bitrate is what the Jetson hardware encoders use in place of crf. Applies to every
-    # image stream, including ones that need no resize.
     extra_encode_kwargs: dict[str, Any] = {}
     if bitrate is not None:
         extra_encode_kwargs['bitrate'] = bitrate
@@ -718,9 +716,6 @@ def port_bags(
 
         lerobot_dataset.finalize()
     finally:  # Ensure image writer is stopped even if an exception occurs
-        # lerobot >= ~0.5 moved this onto DatasetWriter (the same refactor that moved
-        # per_key_encoding_kwargs); calling it on the dataset raises AttributeError there.
-        # Handle both so this works against either version.
         writer = getattr(lerobot_dataset, 'writer', None)
         if writer is not None:
             writer.stop_image_writer()
@@ -779,11 +774,6 @@ def main():
     )
     parser.add_argument(
         "--vcodec", type=str, default="libsvtav1",
-        # Taken from lerobot rather than hardcoded: the accepted set is enforced by
-        # VideoEncoderConfig, and a stale local list silently diverges from it. This
-        # previously offered "libx264", which VideoEncoderConfig rejects outright — the
-        # canonical name is "h264". Also picks up h264_nvmpi / hevc_nvmpi on Jetson builds,
-        # where h264_nvmpi is by far the fastest option and uses --bitrate instead of --crf.
         choices=sorted(VALID_VIDEO_CODECS),
         help=(
             "Video codec for encoding (default: libsvtav1). 'h264' for faster software "
