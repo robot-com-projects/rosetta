@@ -802,10 +802,21 @@ class EpisodeRecorderNode(LifecycleNode):
     # ---------- rosbag2 helpers ----------
 
     def _create_bag_dir(self) -> Path:
-        """Generate unique bag directory name."""
-        t_ns = time.time_ns()
-        sec, nsec = divmod(t_ns, 1_000_000_000)
-        bag_dir = self._bag_base / f'{sec:010d}_{nsec:09d}'
+        """Generate unique bag directory name from the recording start time.
+
+        Named ``YYYYMMDD-HHMMSS-mmm`` so it is final from birth and no consumer
+        has to rename it. ``-<n>`` guards a same-millisecond collision.
+        """
+        # Both fields from one reading: a separate strftime() could land on the
+        # next second and stamp a mismatched pair.
+        sec, nsec = divmod(time.time_ns(), 1_000_000_000)
+        stamp = time.strftime('%Y%m%d-%H%M%S', time.localtime(sec))
+        stamp = f'{stamp}-{nsec // 1_000_000:03d}'
+        bag_dir = self._bag_base / stamp
+        n = 1
+        while bag_dir.exists():
+            bag_dir = self._bag_base / f'{stamp}-{n}'
+            n += 1
         return bag_dir
 
     def _open_writer(self, bag_dir: Path) -> None:
