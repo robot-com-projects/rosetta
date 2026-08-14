@@ -53,6 +53,7 @@ from typing import Any
 
 from PIL import Image as PILImage
 
+from lerobot.configs.video import VALID_VIDEO_CODECS
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.lerobot_dataset import SUPPORTED_IMAGE_FORMATS
 from lerobot.utils.utils import get_elapsed_time_in_days_hours_minutes_seconds
@@ -74,6 +75,7 @@ from .common.contract_utils import (
     zeros_for_spec,
 )
 from .common.converters import decode_value, DTYPES, get_decoder_dtype
+from .bag_video_encoder import BagCameraPlan, PlannedBagVideoEncoder
 from .common.ros2_utils import get_message_timestamp_ns
 
 # Bag metadata keys
@@ -173,6 +175,16 @@ def _peek_compressed_image_sizes(
         remaining.discard(topic)
 
     return sizes
+
+
+def _first_storage_file(bag_dir: Path) -> Path:
+    """Return the bag's storage file, preferring the identifier metadata.yaml declares."""
+    info = _read_bag_metadata(bag_dir).get(BAG_METADATA_KEY, {})
+    storage_id = info.get('storage_identifier', 'mcap')
+    files = list(bag_dir.glob(f'*.{storage_id}')) or list(bag_dir.glob('*.mcap'))
+    if not files:
+        raise RuntimeError(f'No storage file found in {bag_dir}')
+    return files[0]
 
 
 def _get_topic_types(reader: rosbag2_py.SequentialReader) -> dict[str, str]:
@@ -383,6 +395,9 @@ def _sample_frame(
                 frame[key] = zeros_for_spec(spec)
             elif isinstance(val, (bytes, bytearray)):
                 frame[key] = val
+            elif isinstance(val, (int, np.integer)):
+                # plan_video buffers log times, not pixels; pass them through.
+                frame[key] = int(val)
             else:
                 frame[key] = np.asarray(val, dtype=np.uint8)
         elif isinstance(first_spec, ObservationStreamSpec) and first_spec.dtype == 'string':
@@ -442,7 +457,9 @@ def _sample_frame(
     return frame
 
 
-def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], prompt: str = ''):
+def _stream_frames_from_bag(
+    bag_dir: Path, specs: list[StreamSpec], prompt: str = '', plan_video: bool = False
+):
     """
     Stream LeRobot frames from a bag file.
 
@@ -526,7 +543,9 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], prompt: str 
                             resolved = _resolve_msg_format(msg.format)
                             if resolved is not None:
                                 key_formats[spec.key] = resolved
-                        buffer.push(ts, raw)
+                        # Buffer the log time, not the bytes: the resampled column is
+                        # then the plan the encoder consumes, and no JPEG is held.
+                        buffer.push(ts, int(bag_ns) if plan_video else raw)
                         filled_topics.add(topic)
                 else:
                     # Uncompressed image (sensor_msgs/msg/Image) — decode to numpy array (resize in decoder)
@@ -566,6 +585,7 @@ def port_bags(
     encoding_kwargs: dict | None = None,
     batch_encoding_size: int = 1,
     image_writer_threads: int = 8,
+    fast_video: bool = True,
 ):
     """
     Port ROS2 bags to LeRobot dataset format.
@@ -614,6 +634,36 @@ def port_bags(
     dataset_root = root / repo_id if root else None
     _encoding_kwargs = dict(encoding_kwargs or {})
     vcodec = _encoding_kwargs.pop("vcodec", "libsvtav1")
+    bitrate = _encoding_kwargs.pop("bitrate", None)
+    image_specs_for_plan = [
+        spec
+        for spec in specs
+        if isinstance(spec, ObservationStreamSpec)
+        and spec.is_image
+        and spec.msg_type == 'sensor_msgs/msg/CompressedImage'
+        and spec.image_resize
+    ]
+    video_encoder = None
+    if fast_video and image_specs_for_plan:
+        video_encoder = PlannedBagVideoEncoder(
+            fps=int(contract.fps),
+            vcodec=vcodec,
+            pix_fmt=_encoding_kwargs.get('pix_fmt', 'yuv420p'),
+            codec_options={
+                k: str(v)
+                for k, v in (
+                    ('g', _encoding_kwargs.get('g', 2)),
+                    ('crf', _encoding_kwargs.get('crf')),
+                    ('b', bitrate),
+                )
+                if v is not None
+            },
+        )
+        logging.info(
+            'fast video: MCAP -> MP4 directly for %d camera(s), no intermediate JPEGs',
+            len(image_specs_for_plan),
+        )
+
     lerobot_dataset = LeRobotDataset.create(
         repo_id=repo_id,
         root=dataset_root,
@@ -621,10 +671,10 @@ def port_bags(
         fps=contract.fps,
         features=features,
         vcodec=vcodec,
+        streaming_encoder=video_encoder,
         encoding_kwargs=_encoding_kwargs or None,
         batch_encoding_size=batch_encoding_size,
         image_writer_threads=image_writer_threads,
-        defer_video_encoding=False,
     )
     # Build per-camera resize map for CompressedImage keys only.
     # sensor_msgs/msg/Image keys are already resized by the decoder; bytes keys are passthrough
@@ -643,13 +693,20 @@ def port_bags(
         if compressed_image_specs
         else {}
     )
-    per_key_resize = {
+    per_key_kwargs: dict[str, dict[str, Any]] = {
         spec.key: {'target_size': tuple(spec.image_resize)}
         for spec in compressed_image_specs
         if actual_sizes.get(spec.key) != tuple(spec.image_resize)
     }
-    if per_key_resize:
-        lerobot_dataset.per_key_encoding_kwargs = per_key_resize
+    extra_encode_kwargs: dict[str, Any] = {}
+    if bitrate is not None:
+        extra_encode_kwargs['bitrate'] = bitrate
+    if extra_encode_kwargs:
+        for spec in specs:
+            if isinstance(spec, ObservationStreamSpec) and spec.is_image:
+                per_key_kwargs.setdefault(spec.key, {}).update(extra_encode_kwargs)
+    if per_key_kwargs:
+        lerobot_dataset.writer.per_key_encoding_kwargs = per_key_kwargs
 
     start_time = time.time()
     num_episodes = len(bag_dirs)
@@ -677,10 +734,55 @@ def port_bags(
                             f"Add prompt to custom_data in metadata.yaml or pass --prompt."
                         )
 
-                frame_count = 0
-                for frame, key_formats in _stream_frames_from_bag(bag_dir, specs, prompt=episode_prompt):
-                    lerobot_dataset.add_frame_bytes(frame, format=key_formats or None)
-                    frame_count += 1
+                if video_encoder is not None:
+                    rows: list[dict] = []
+                    for frame, _fmts in _stream_frames_from_bag(
+                        bag_dir, specs, prompt=episode_prompt, plan_video=True
+                    ):
+                        rows.append(frame)
+                    frame_count = len(rows)
+                    if frame_count == 0:
+                        raise RuntimeError(f'No frames produced for {bag_dir.name}')
+
+                    plans = []
+                    for spec in image_specs_for_plan:
+                        times = [r.get(spec.key) for r in rows]
+                        if any(t is None for t in times):
+                            raise RuntimeError(
+                                f'{spec.key}: {sum(t is None for t in times)} of {frame_count} '
+                                f'rows have no message in {bag_dir.name}'
+                            )
+                        height, width = (
+                            int(spec.image_resize[0]), int(spec.image_resize[1])
+                        )
+                        plans.append(
+                            BagCameraPlan(
+                                video_key=spec.key,
+                                topic=spec.topic,
+                                log_times=np.asarray(times, dtype=np.int64),
+                                width=width,
+                                height=height,
+                            )
+                        )
+
+                    mcap_path = _first_storage_file(bag_dir)
+                    video_encoder.set_episode_plan(mcap_path, plans, frame_count)
+                    video_encoder.start_episode(
+                        [p.video_key for p in plans], Path(lerobot_dataset.root)
+                    )
+                    logging.info('  video encode started: %s', video_encoder.last_plan_summary)
+
+                    video_keys = {p.video_key for p in plans}
+                    for row in rows:
+                        lerobot_dataset.add_frame_bytes(
+                            {k: v for k, v in row.items() if k not in video_keys}
+                        )
+                    rows.clear()
+                else:
+                    frame_count = 0
+                    for frame, key_formats in _stream_frames_from_bag(bag_dir, specs, prompt=episode_prompt):
+                        lerobot_dataset.add_frame_bytes(frame, format=key_formats or None)
+                        frame_count += 1
 
                 lerobot_dataset.save_episode()
                 successful += 1
@@ -707,8 +809,12 @@ def port_bags(
             raise RuntimeError(f'All {num_episodes} bags failed to convert')
 
         lerobot_dataset.finalize()
-    finally: # Ensure image writer is stopped even if an exception occurs
-        lerobot_dataset.stop_image_writer()
+    finally:  # Ensure image writer is stopped even if an exception occurs
+        writer = getattr(lerobot_dataset, 'writer', None)
+        if writer is not None:
+            writer.stop_image_writer()
+        elif hasattr(lerobot_dataset, 'stop_image_writer'):
+            lerobot_dataset.stop_image_writer()
 
     if push_to_hub:
         lerobot_dataset.push_to_hub(
@@ -722,7 +828,7 @@ def port_bags(
 
 def main():
     """CLI entry point."""
-    logging.basicConfig(level=logging.INFO, format='%(message)s')
+    logging.basicConfig(level=logging.INFO, format='%(message)s', force=True)
 
     parser = argparse.ArgumentParser(
         description="Port ROS2 bags to LeRobot dataset"
@@ -762,8 +868,18 @@ def main():
     )
     parser.add_argument(
         "--vcodec", type=str, default="libsvtav1",
-        choices=["libsvtav1", "libx264", "h264", "hevc", "h264_nvenc"],
-        help="Video codec for encoding (default: libsvtav1). Use libx264/h264 for faster encoding."
+        choices=sorted(VALID_VIDEO_CODECS),
+        help=(
+            "Video codec for encoding (default: libsvtav1). 'h264' for faster software "
+            "encoding, 'h264_nvmpi' on Jetson for hardware encoding."
+        )
+    )
+    parser.add_argument(
+        "--bitrate", type=str, default=None,
+        help=(
+            "Target bitrate for hardware encoders, FFmpeg style (e.g. '8M'). Used by "
+            "h264_nvmpi / hevc_nvmpi, which have no CRF mode. Ignored by software codecs."
+        )
     )
     parser.add_argument(
         "--pix-fmt", type=str, default=None,
@@ -780,6 +896,13 @@ def main():
     parser.add_argument(
         "--fast-decode", type=int, default=None,
         help="Fast-decode tuning flag (default: 0, codec-dependent)."
+    )
+    parser.add_argument(
+        "--no-fast-video", action="store_true",
+        help=(
+            "Disable the planned MCAP->MP4 encoder and fall back to writing intermediate "
+            "JPEGs for encode_video_frames. Slower; kept as an escape hatch."
+        )
     )
     parser.add_argument(
         "--image-writer-threads", type=int, default=8,
@@ -801,6 +924,8 @@ def main():
         encoding_kwargs["crf"] = args.crf
     if args.fast_decode is not None:
         encoding_kwargs["fast_decode"] = args.fast_decode
+    if args.bitrate is not None:
+        encoding_kwargs["bitrate"] = args.bitrate
 
     try:
         port_bags(
@@ -814,6 +939,7 @@ def main():
             shard_index=args.shard_index,
             encoding_kwargs=encoding_kwargs or None,
             image_writer_threads=args.image_writer_threads,
+            fast_video=not args.no_fast_video,
         )
     except KeyboardInterrupt:
         logging.info('\nInterrupted by user')
