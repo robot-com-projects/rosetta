@@ -180,6 +180,11 @@ def _get_topic_types(reader: rosbag2_py.SequentialReader) -> dict[str, str]:
     return {t.name: t.type for t in reader.get_all_topics_and_types()}
 
 
+def _is_differentiated(spec: StreamSpec) -> bool:
+    """True when a spec's values come from the derivative pass, not a buffer."""
+    return bool(getattr(spec, 'differentiate', False))
+
+
 def _build_buffers(
     specs: list[StreamSpec],
     topic_types: dict[str, str],
@@ -200,7 +205,7 @@ def _build_buffers(
             continue
 
         # Derivative specs are handled by _precompute_derivatives, not StreamBuffer
-        if isinstance(spec, ObservationStreamSpec) and spec.differentiate:
+        if _is_differentiated(spec):
             continue
 
         if isinstance(spec, ObservationStreamSpec):
@@ -278,7 +283,7 @@ def _nearest_idx(timestamps: np.ndarray, t: int) -> int:
 def _precompute_derivatives(
     uri: str,
     storage_id: str,
-    deriv_specs: list[ObservationStreamSpec],
+    deriv_specs: list[StreamSpec],
 ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """First pass: collect full-rate position data and compute velocity via np.gradient.
 
@@ -340,55 +345,63 @@ DTYPE_MAP = {
 }
 
 
+def _derivative_value(
+    spec: StreamSpec,
+    tick_ns: int,
+    derivatives: dict[str, tuple[np.ndarray, np.ndarray]] | None,
+    np_dtype: Any,
+) -> np.ndarray:
+    """Pre-computed velocity for `spec` at `tick_ns` (zeros when unavailable)."""
+    entry = derivatives.get(spec.topic) if derivatives else None
+    if entry is None:
+        return np.zeros(max(len(spec.names), 1), dtype=np_dtype)
+    ts_arr, vel_arr = entry
+    return vel_arr[_nearest_idx(ts_arr, tick_ns), :len(spec.names)].astype(np_dtype)
+
+
 def _sample_frame(
     tick_ns: int,
     buffers: dict[str, tuple[StreamSpec, StreamBuffer]],
-    deriv_specs: list[ObservationStreamSpec] | None = None,
+    specs: list[StreamSpec],
     derivatives: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> dict[str, Any]:
     """
     Sample a single frame from buffers at the given tick time.
 
-    Specs sharing the same key are aggregated (concatenated in insertion order).
-    Derivative specs (differentiate='true') are looked up from pre-computed arrays
-    and appended after regular buffer values for the same key.
+    Specs sharing the same key are aggregated into one vector, in the order
+    `specs` declares them -- the order `_build_features` names the columns in.
+    Differentiated specs hold no StreamBuffer (their values come from the
+    pre-computed `derivatives`) but still own their declared column slot.
     """
-    # Group by output key, preserving insertion order
-    by_key: dict[str, list[tuple[StreamSpec, StreamBuffer]]] = {}
-    for spec, buffer in buffers.values():
-        by_key.setdefault(spec.key, []).append((spec, buffer))
+    # Contract order. A regular spec contributes once its topic is in the bag;
+    # a differentiated spec always does, or the columns after it would shift.
+    by_key: dict[str, list[StreamSpec]] = {}
+    for spec in specs:
+        if spec.topic in buffers or _is_differentiated(spec):
+            by_key.setdefault(spec.key, []).append(spec)
 
-    # Group derivative specs by key so they can be appended after regular values
-    deriv_by_key: dict[str, list[ObservationStreamSpec]] = {}
-    for spec in (deriv_specs or []):
-        deriv_by_key.setdefault(spec.key, []).append(spec)
-
-    # Union of all keys (regular + derivative)
-    all_keys = list(dict.fromkeys(list(by_key) + list(deriv_by_key)))
+    def sample(spec: StreamSpec) -> Any:
+        entry = buffers.get(spec.topic)
+        return entry[1].sample(tick_ns) if entry is not None else None
 
     frame: dict[str, Any] = {}
 
-    for key in all_keys:
-        items = by_key.get(key, [])
-        d_specs = deriv_by_key.get(key, [])
-
-        # Determine the first available spec to classify the key type
-        first_spec = items[0][0] if items else d_specs[0]
+    for key, key_specs in by_key.items():
+        # The first contributing spec classifies the key type
+        first_spec = key_specs[0]
 
         if isinstance(first_spec, ObservationStreamSpec) and first_spec.is_image:
             # Image: single value (no aggregation)
-            spec, buffer = items[0]
-            val = buffer.sample(tick_ns)
+            val = sample(first_spec)
             if val is None:
-                frame[key] = zeros_for_spec(spec)
+                frame[key] = zeros_for_spec(first_spec)
             elif isinstance(val, (bytes, bytearray)):
                 frame[key] = val
             else:
                 frame[key] = np.asarray(val, dtype=np.uint8)
         elif isinstance(first_spec, ObservationStreamSpec) and first_spec.dtype == 'string':
             # String: pass through
-            spec, buffer = items[0]
-            val = buffer.sample(tick_ns)
+            val = sample(first_spec)
             frame[key] = str(val) if val is not None else ''
         elif isinstance(first_spec, ObservationStreamSpec) and first_spec.dtype in (
             'bool',
@@ -396,8 +409,7 @@ def _sample_frame(
             'int64',
         ):
             # Scalar types: single value
-            spec, buffer = items[0]
-            val = buffer.sample(tick_ns)
+            val = sample(first_spec)
             np_dtype = DTYPE_MAP[first_spec.dtype]  # already validated above
             if val is None:
                 frame[key] = np.zeros(1, dtype=np_dtype)
@@ -419,23 +431,16 @@ def _sample_frame(
             np_dtype = DTYPE_MAP[dtype_str]
 
             values = []
-            for spec, buffer in items:
-                val = buffer.sample(tick_ns)
+            for spec in key_specs:
+                if _is_differentiated(spec):
+                    values.append(_derivative_value(spec, tick_ns, derivatives, np_dtype))
+                    continue
+                val = sample(spec)
                 if val is None:
                     val = np.zeros(max(len(spec.names), 1), dtype=np_dtype)
                 else:
                     val = np.asarray(val, dtype=np_dtype).flatten()
                 values.append(val)
-
-            # Append pre-computed velocity values (nearest-timestamp lookup)
-            for spec in d_specs:
-                if derivatives and spec.topic in derivatives:
-                    ts_arr, vel_arr = derivatives[spec.topic]
-                    idx = _nearest_idx(ts_arr, tick_ns)
-                    vel = vel_arr[idx, :len(spec.names)].astype(np_dtype)
-                else:
-                    vel = np.zeros(len(spec.names), dtype=np_dtype)
-                values.append(vel)
 
             frame[key] = np.concatenate(values) if len(values) > 1 else values[0]
 
@@ -474,12 +479,8 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], prompt: str 
     topic_types = _get_topic_types(reader)
     buffers = _build_buffers(specs, topic_types)
 
-    # Pre-compute velocity for differentiate=true specs
-    deriv_specs = [
-        s for s in specs
-        if isinstance(s, ObservationStreamSpec) and s.differentiate
-        and s.topic in topic_types
-    ]
+    # Pre-compute velocity for differentiate=true specs (observations and actions)
+    deriv_specs = [s for s in specs if _is_differentiated(s) and s.topic in topic_types]
     derivatives = _precompute_derivatives(uri, storage_id, deriv_specs) if deriv_specs else {}
 
     start_ns, end_ns = _get_bag_time_bounds_ns(reader)
@@ -498,7 +499,7 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], prompt: str 
         all_warm = required_topics.issubset(filled_topics)
         while current_tick_idx < n_frames and bag_ns >= current_tick_ns:
             if all_warm: # Only emit frames after all required topics have been filled at least once
-                frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
+                frame = _sample_frame(current_tick_ns, buffers, specs, derivatives)
                 frame['task'] = prompt
                 yield frame, key_formats
             current_tick_idx += 1
@@ -543,7 +544,7 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec], prompt: str 
 
     # Emit remaining frames 
     while current_tick_idx < n_frames:
-        frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
+        frame = _sample_frame(current_tick_ns, buffers, specs, derivatives)
         frame['task'] = prompt
         yield frame, key_formats
 
