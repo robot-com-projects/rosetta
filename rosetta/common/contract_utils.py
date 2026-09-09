@@ -435,6 +435,7 @@ def iter_action_specs(contract: Contract) -> Iterable[ActionStreamSpec]:
             'decoder': a.decoder,
             'encoder': a.encoder,
             'unit_conversion': a.unit_conversion,
+            'differentiate': a.differentiate,
         }
         items.append((a.publish_topic, kwargs, a))
 

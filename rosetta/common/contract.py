@@ -159,6 +159,7 @@ class ActionSpec:
     decoder: str | None = None  # Custom decoder path: "module.path:function_name"
     encoder: str | None = None  # Custom encoder path: "module.path:function_name"
     unit_conversion: str | None = None  # "rad2deg" | None
+    differentiate: bool = False  # differentiate full-rate data via np.gradient
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +291,7 @@ class ActionStreamSpec(StreamSpec):
     decoder: str | None = None  # Custom decoder path
     encoder: str | None = None  # Custom encoder path
     unit_conversion: str | None = None  # "rad2deg" | None
+    differentiate: bool = False  # differentiate full-rate data via np.gradient
 
 
 # =============================================================================
@@ -502,6 +504,7 @@ def _parse_action(data: dict[str, Any], idx: int, section: str = 'actions') -> A
         decoder=_validate_converter_path(data.get('decoder'), f'{ctx}.decoder'),
         encoder=_validate_converter_path(data.get('encoder'), f'{ctx}.encoder'),
         unit_conversion=uc,
+        differentiate=bool(data.get('differentiate', False)),
     )
 
 
