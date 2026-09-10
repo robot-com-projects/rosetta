@@ -77,6 +77,7 @@ from .common.contract_utils import (
 from .common.converters import decode_value, DTYPES, get_decoder_dtype
 from .bag_video_encoder import BagCameraPlan, PlannedBagVideoEncoder
 from .common.ros2_utils import get_message_timestamp_ns
+from .common.stamp_guard import StampMonotonicityGuard
 
 # Bag metadata keys
 BAG_METADATA_KEY = 'rosbag2_bagfile_information'
@@ -458,13 +459,19 @@ def _sample_frame(
 
 
 def _stream_frames_from_bag(
-    bag_dir: Path, specs: list[StreamSpec], prompt: str = '', plan_video: bool = False
+    bag_dir: Path,
+    specs: list[StreamSpec],
+    prompt: str = '',
+    plan_video: bool = False,
+    max_stamp_backward_jump_s: float = 0.0,
 ):
     """
     Stream LeRobot frames from a bag file.
 
     Uses StreamBuffer for resampling (identical to live inference).
     Specs sharing the same key are aggregated into single tensors.
+    Header stamped streams are guarded against backward stamp jumps
+    (see StampMonotonicityGuard); a negative tolerance disables that.
     """
     fps = specs[0].fps
     step_ns = int(1e9 / fps)
@@ -504,6 +511,7 @@ def _stream_frames_from_bag(
 
     current_tick_idx = 0
     current_tick_ns = start_ns
+    stamp_guard = StampMonotonicityGuard(max_stamp_backward_jump_s)
     header_warned: set[str] = set()
     filled_topics: set[str] = set()
     required_topics: set[str] = set(buffers.keys())
@@ -533,6 +541,8 @@ def _stream_frames_from_bag(
                     bag_dir.name,
                 )
                 header_warned.add(spec.key)
+            if spec.stamp_src == 'header':
+                stamp_guard.check(topic, spec.key, ts)
             if isinstance(spec, ObservationStreamSpec) and spec.is_image:
                 if spec.msg_type == 'sensor_msgs/msg/CompressedImage':
                     # Push raw bytes — lerobot sniffs the format from the bytes
@@ -586,6 +596,7 @@ def port_bags(
     batch_encoding_size: int = 1,
     image_writer_threads: int = 8,
     fast_video: bool = True,
+    max_stamp_backward_jump_s: float = 0.0,
 ):
     """
     Port ROS2 bags to LeRobot dataset format.
@@ -605,6 +616,9 @@ def port_bags(
         batch_encoding_size: Number of episodes per encoding batch. Defaults to 1 for immediate encoding.
         image_writer_threads: Number of image-writer threads for parallel frame writes.
             Set to 0 to disable the thread pool.
+        max_stamp_backward_jump_s: Largest tolerated backward stamp jump on a
+            header stamped stream, in seconds. 0 rejects any regression while
+            allowing repeated stamps; a negative value disables the check.
     """
     contract = load_contract(contract_path)
     specs = list(iter_specs(contract))
@@ -737,7 +751,11 @@ def port_bags(
                 if video_encoder is not None:
                     rows: list[dict] = []
                     for frame, _fmts in _stream_frames_from_bag(
-                        bag_dir, specs, prompt=episode_prompt, plan_video=True
+                        bag_dir,
+                        specs,
+                        prompt=episode_prompt,
+                        plan_video=True,
+                        max_stamp_backward_jump_s=max_stamp_backward_jump_s,
                     ):
                         rows.append(frame)
                     frame_count = len(rows)
@@ -780,7 +798,12 @@ def port_bags(
                     rows.clear()
                 else:
                     frame_count = 0
-                    for frame, key_formats in _stream_frames_from_bag(bag_dir, specs, prompt=episode_prompt):
+                    for frame, key_formats in _stream_frames_from_bag(
+                        bag_dir,
+                        specs,
+                        prompt=episode_prompt,
+                        max_stamp_backward_jump_s=max_stamp_backward_jump_s,
+                    ):
                         lerobot_dataset.add_frame_bytes(frame, format=key_formats or None)
                         frame_count += 1
 
@@ -908,6 +931,13 @@ def main():
         "--image-writer-threads", type=int, default=8,
         help="Number of image-writer threads for parallel frame writes (default: 8). Set to 0 to disable."
     )
+    parser.add_argument(
+        "--max-stamp-backward-jump-s", type=float, default=0.0,
+        help=(
+            "Largest tolerated backward stamp jump on a header stamped stream, in seconds "
+            "(default: 0, any regression fails the bag). Negative disables the check."
+        )
+    )
 
     args = parser.parse_args()
 
@@ -940,6 +970,7 @@ def main():
             encoding_kwargs=encoding_kwargs or None,
             image_writer_threads=args.image_writer_threads,
             fast_video=not args.no_fast_video,
+            max_stamp_backward_jump_s=args.max_stamp_backward_jump_s,
         )
     except KeyboardInterrupt:
         logging.info('\nInterrupted by user')
