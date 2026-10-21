@@ -367,6 +367,12 @@ def _count_packets(path: Path) -> int:
         return sum(1 for p in container.demux(stream) if p.dts is not None)
 
 
+def _first_pts(path: Path) -> int:
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        return next(p.pts for p in container.demux(stream) if p.pts is not None)
+
+
 class PlannedBagVideoEncoder:
     """Encodes episode videos straight from an MCAP bag, in parallel, without intermediate files.
 
@@ -391,7 +397,8 @@ class PlannedBagVideoEncoder:
         self._fps = int(fps)
         self._vcodec = vcodec
         self._pix_fmt = pix_fmt
-        self._codec_options = dict(codec_options or {})
+        # Fragmented MP4 has no edit list, so B-frame reorder delay would offset every pts.
+        self._codec_options = {**(codec_options or {}), "bf": "0"}
         self._target_units = int(target_units)
         self._max_concurrent = max(1, int(max_concurrent))
         self._decode_threads = max(1, int(decode_threads))
@@ -529,6 +536,9 @@ class PlannedBagVideoEncoder:
                     f"{plan.video_key}: encoded video holds {stored} frames but the episode "
                     f"has {plan.num_rows} rows"
                 )
+            start = _first_pts(final)
+            if start != 0:
+                raise RuntimeError(f"{plan.video_key}: encoded video starts at pts {start}, not 0")
             ordered_samples = [
                 image
                 for index in sorted(samples[plan.video_key])
