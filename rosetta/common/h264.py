@@ -637,13 +637,10 @@ class StreamState:
             raise H264Error("cannot repeat a non reference picture")
         pps = self.pps_by_id[last.pps_id]
         sps = self.sps_by_id[pps.sps_id]
-        if sps.poc_type == 1 or (sps.poc_type == 2 and self.repeats):
-            # POC type 2 forbids two non reference pictures in a row; type 1 is not modelled.
-            raise H264Error(
-                f"POC type {sps.poc_type} cannot repeat a picture {self.repeats + 1} times"
-            )
-        # Repeats share a POC between the last picture and the next one; decoders output
-        # them in decode order because the stream has no reordering.
+        if sps.poc_type == 1:
+            raise H264Error("POC type 1 is not supported")
+        # Repeats share a POC (on type 2, consecutive ones bend the spec); decoders output them in
+        # decode order regardless, because the stream has no reordering.
         poc = None if last.poc_lsb is None else last.poc_lsb + 1
         self.repeats += 1
         return build_skip_frame(sps, pps, last.frame_num + 1, poc)

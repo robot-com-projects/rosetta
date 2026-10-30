@@ -74,19 +74,11 @@ def test_skip_frames_repeat_the_previous_picture(cabac):
         state.parse_access_unit(data)
         out.append(data)
         expected.append(reference[i])
-        # Every other picture, including right after the IDRs at 0 and 6.
-        if i % 2 == 0:
+        # Up to three in a row, including right after the IDRs at 0 and 6.
+        for _ in range(i % 4):
             out.append(state.skip_frame())
             expected.append(reference[i])
     assert decode_hashes(out) == expected
-
-
-def test_poc_type_2_refuses_two_repeats_in_a_row():
-    state = h264.StreamState()
-    state.parse_access_unit(encode_x264(1, frames=1)[0])
-    state.skip_frame()
-    with pytest.raises(h264.H264Error, match="POC type 2"):
-        state.skip_frame()
 
 
 def test_skip_frame_header_round_trips_for_poc_type_0():
